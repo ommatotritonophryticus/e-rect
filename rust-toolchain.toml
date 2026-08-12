@@ -1,0 +1,11 @@
+# The host toolchain for erect-core, erect-audio and erect-desktop.
+#
+# Pinned to an exact release rather than "stable" so a build on another machine
+# resolves the same compiler this was verified against. Newer stables are
+# expected to work; raise the number here when you move.
+#
+# erect-psp is not covered by this file - it carries its own, because cargo-psp
+# needs nightly. rustup picks the nearest rust-toolchain.toml walking up from
+# the working directory, so building inside erect-psp gets that one instead.
+[toolchain]
+channel = "1.97.1"

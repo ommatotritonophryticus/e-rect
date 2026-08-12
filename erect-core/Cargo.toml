@@ -1,0 +1,9 @@
+[package]
+name = "erect-core"
+description = "Platform-free game logic for E-Rect: simulation, waves, menus, settings data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# no_std has no float methods on f32; libm supplies sin/ln/sqrt/powf/floor.
+libm = "0.2"

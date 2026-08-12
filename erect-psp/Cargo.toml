@@ -1,0 +1,31 @@
+[package]
+name = "erect-psp"
+description = "PSP frontend for E-Rect: sceGu rendering, sceCtrl input, Memory Stick saves"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+erect-core = { path = "../erect-core" }
+erect-audio = { path = "../erect-audio" }
+psp = "0.3"
+libm = "0.2"
+
+[build-dependencies]
+# Runs on the host at build time to bake font.ttf into a bitmap atlas: the PSP
+# cannot afford to rasterise TrueType at 222 MHz.
+fontdue = "0.9"
+
+[features]
+# Dumps raw framebuffers to the Memory Stick and exits, so rendering can be
+# checked from the host. Development aid only; never enabled in a real build.
+screenshot = []
+# Drops the vblank wait so throughput can be measured. The 60 Hz cap otherwise
+# hides how much headroom is actually left. Development aid only.
+bench = []
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[package.metadata.psp]
+title = "E-Rect"

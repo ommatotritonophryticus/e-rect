@@ -1,0 +1,26 @@
+[package]
+name = "erect-desktop"
+description = "Desktop frontend for E-Rect: macroquad rendering, keyboard and gamepads"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "erect"
+path = "src/main.rs"
+
+[dependencies]
+erect-core = { path = "../erect-core" }
+erect-audio = { path = "../erect-audio" }
+# 2D rendering + windowing + keyboard. No system libraries on Windows/macOS,
+# only the usual X11/GL ones on Linux.
+macroquad = "0.4"
+# Cross-platform gamepads: XInput on Windows, evdev on Linux, IOKit on macOS.
+gilrs = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Per-OS config directory for the settings file.
+directories = "5"
+# Own mixer + raw device access: six layers must stay sample-locked, which
+# per-source playback APIs cannot guarantee.
+cpal = "0.15"
+claxon = "0.4"

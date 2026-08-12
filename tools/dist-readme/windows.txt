@@ -1,0 +1,29 @@
+E-Rect for Windows (x86-64)
+===========================
+
+Run erect.exe. Keep the packs folder next to it - that is where the music and
+sound effects live. Without it the game still runs, just silently.
+
+Controls
+--------
+    Player 1   W A S D, SPACE to attack
+    Player 2   arrow keys, ENTER to attack
+    Gamepads   supported; pick a scheme per player in Settings
+    ESC        pause
+
+    move left/right   walk          jump   leave the ground
+    down while airborne             ground slam (puts up the wall)
+
+Settings and high scores go to %APPDATA%\erect\settings.json
+
+Built by cross-compiling from macOS with cargo-zigbuild, and NOT tested on
+Windows. It links only against system DLLs, so nothing else needs installing,
+but treat the first run as the real test.
+
+Licences
+--------
+E-Rect is GPL-3.0; the full text is in LICENSE. The music and sound effects are
+original work by the project author, under that same licence.
+
+The font is Tiny5 by the Tiny5 Project Authors, under the SIL Open Font License
+1.1. Its full text is in LICENSE-Tiny5.txt, alongside this file.

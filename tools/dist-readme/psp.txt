@@ -1,0 +1,71 @@
+E-Rect for PSP
+==============
+
+Install
+-------
+Copy the PSP folder from this archive to the root of your Memory Stick, so you
+end up with:
+
+    ms0:/PSP/GAME/ERECT/EBOOT.PBP
+    ms0:/PSP/GAME/ERECT/pack/pack1/*.wav
+    ms0:/PSP/GAME/ERECT/pack/pack2/*.wav
+
+Then start it from the PSP's Game menu (Memory Stick).
+
+Two soundtracks ship and one is drawn at random every time you reach the menu
+and every time you start a run, so a session moves between them. Both have to be
+present: they are held in memory together, which is what makes the change
+instant instead of a pause while six megabytes are re-read.
+
+If the game cannot find them the title screen says so along the bottom, so if it
+is quiet, look there first. In an emulator the path is relative to whatever you
+have configured as the memory stick root, not to wherever the EBOOT itself was
+opened from.
+
+Homebrew needs custom firmware. On stock firmware the EBOOT will not launch.
+Tested in PPSSPP 1.20.4; not verified on real hardware.
+
+Controls
+--------
+    D-pad / analog nub   move
+    Cross                jump
+    Square               attack
+    Circle / Down        ground slam - puts up the wall
+    Start                pause menu
+    Home                 quit
+
+The field runs on forever left and right; the view follows you. Enemies come to
+wherever you are, so running does not lose them for long.
+
+Wounded players bank energy for the wall faster - up to three times as fast on
+the brink.
+
+Waves
+-----
+Every fifth wave is a boss wave. Wave 10 belongs to a single flying boss: twice
+the size of an ordinary flyer, and it blinks away every time you land a hit.
+
+A wave can carry up to two modifiers, one of each kind, announced during the
+countdown:
+
+    who turns up      GROUND ONLY, FLYERS ONLY, HORDE, JUMPERS
+    how it plays      HOLD THE LINE  view is pinned, you start on full health
+                      GROUNDED       no jumping; down raises the wall, longer reach
+                      NO WALL        the slam buys invulnerability; landing heals
+                      BLIND          you cannot see them, they can barely hurt you
+
+Nothing explodes for damage. Red blinkers leave a blast and reappear at the edge
+of the field when touched, and once more the first time you hit one. Shooters
+show a white sight that turns red for the last 100 ms before they fire - that is
+the moment to step out of the line.
+
+Music and effect volumes are in Settings.
+Settings and high scores are written to ms0:/PSP/GAME/ERECT/settings.dat
+
+Licences
+--------
+E-Rect is GPL-3.0; the full text is in LICENSE. The music and sound effects are
+original work by the project author, under that same licence.
+
+The font is Tiny5 by the Tiny5 Project Authors, under the SIL Open Font License
+1.1. Its full text is in LICENSE-Tiny5.txt, alongside this file.

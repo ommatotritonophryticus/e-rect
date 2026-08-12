@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["erect-core", "erect-audio", "erect-desktop"]
+# erect-psp is deliberately excluded: it only builds for the `mipsel-sony-psp`
+# target via `cargo psp`, and having it in the workspace would break a plain
+# `cargo build` on the host. Build it from inside its own directory.
+exclude = ["erect-psp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = true

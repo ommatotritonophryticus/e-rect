@@ -1,0 +1,11 @@
+# cargo-psp needs nightly, and builds core from source for `mipsel-sony-psp`,
+# which is what `rust-src` is for. Pinned in-tree rather than through
+# `rustup override`, so a fresh clone builds without extra setup.
+#
+# The date is exact on purpose. An open "nightly" would drift onto a compiler
+# the psp crate and cargo-psp have never seen, and that breakage lands on
+# whoever builds next rather than on whoever moved the pin. This is the nightly
+# the PSP build was verified against: rustc 1.99.0-nightly (73dc9167f).
+[toolchain]
+channel = "nightly-2026-08-02"
+components = ["rust-src"]

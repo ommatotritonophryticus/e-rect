@@ -1,0 +1,9 @@
+[package]
+name = "erect-audio"
+description = "Adaptive music mixing for E-Rect: layer gains, fades and a software mixer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+erect-core = { path = "../erect-core" }
+libm = "0.2"

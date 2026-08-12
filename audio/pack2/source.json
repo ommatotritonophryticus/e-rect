@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "name": "pack2",
+  "description": "Second chiptune set: same roles, different composition",
+
+  "music": {
+    "//": "Unlike pack1 this one needs no trimming. The exported file is already",
+    "//2": "a complete loop: 1088640 samples divides into 64 beats exactly, and",
+    "//3": "the seam measures smoother than a typical moment inside the track.",
+    "trim_start": 0,
+    "loop_samples": 1088640,
+    "bpm": 155.56,
+    "bars": 16,
+    "target_peak_dbfs": -4.0,
+    "layers": [
+      { "id": "all_time", "src": "all.mp3", "mode": "always" },
+      { "id": "leisure",  "src": "leisure.mp3",  "mode": "situation", "group": "base",
+        "when": ["calm", "paused"], "fade_in_ms": 700, "fade_out_ms": 700 },
+      { "id": "fight",    "src": "fight.mp3",    "mode": "situation", "group": "base",
+        "when": ["combat"], "fade_in_ms": 700, "fade_out_ms": 700 },
+      { "id": "zombie",   "src": "zombie.mp3",   "mode": "count", "count_of": "zombie",
+        "steps_db": [[1, -12], [2, -6], [3, 0]], "mute_when": ["paused"],
+        "fade_in_ms": 250, "fade_out_ms": 900, "hold_ms": 700 },
+      { "id": "garp",     "src": "garp.mp3",     "mode": "count", "count_of": "flyer",
+        "steps_db": [[1, -12], [2, -6], [3, 0]], "mute_when": ["paused"],
+        "fade_in_ms": 250, "fade_out_ms": 900, "hold_ms": 700 },
+      { "id": "boss",     "src": "boss.mp3",     "mode": "flag", "flag": "boss",
+        "mute_when": ["paused"], "fade_in_ms": 120, "fade_out_ms": 1500 }
+    ]
+  },
+
+  "sfx": {
+    "//": "Byte-for-byte the same three sounds pack1 ships; only the music differs.",
+    "target_peak_dbfs": -8.0,
+    "trim_tail_below_dbfs": -60.0,
+    "mute_when": ["paused"],
+    "sounds": [
+      { "id": "hit",  "src": "hit.mp3",  "max_voices": 4, "min_interval_ms": 40 },
+      { "id": "jump", "src": "jump.mp3", "max_voices": 2, "min_interval_ms": 60 },
+      { "id": "down", "src": "down.mp3", "max_voices": 3, "min_interval_ms": 60 }
+    ]
+  }
+}

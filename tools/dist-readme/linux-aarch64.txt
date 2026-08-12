@@ -1,0 +1,40 @@
+E-Rect for Linux (aarch64)
+===========================
+
+Run ./erect. Keep the packs folder next to it - that is where the music and
+sound effects live. Without it the game still runs, just silently.
+
+Requirements
+------------
+Built on Debian 12, so it needs glibc 2.36 or newer. It links against the
+system ALSA and udev libraries; on most desktops these are already present.
+If not:
+
+    Debian/Ubuntu   sudo apt install libasound2 libudev1
+    Fedora          sudo dnf install alsa-lib systemd-libs
+    Arch            already present in base
+
+X11 and OpenGL are loaded at runtime. Under Wayland it runs through Xwayland.
+
+Controls
+--------
+    Player 1   W A S D, SPACE to attack
+    Player 2   arrow keys, ENTER to attack
+    Gamepads   supported; pick a scheme per player in Settings
+    ESC        pause
+
+    move left/right   walk          jump   leave the ground
+    down while airborne             ground slam (puts up the wall)
+
+Settings and high scores go to ~/.config/erect/settings.json
+
+Built in a Debian container on macOS and NOT run on Linux. Treat the first
+launch as the real test.
+
+Licences
+--------
+E-Rect is GPL-3.0; the full text is in LICENSE. The music and sound effects are
+original work by the project author, under that same licence.
+
+The font is Tiny5 by the Tiny5 Project Authors, under the SIL Open Font License
+1.1. Its full text is in LICENSE-Tiny5.txt, alongside this file.

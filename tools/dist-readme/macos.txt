@@ -1,0 +1,39 @@
+E-Rect for macOS (Apple Silicon)
+================================
+
+Run ./erect. Keep the packs folder next to it - that is where the music and
+sound effects live. Without it the game still runs, just silently.
+
+Gatekeeper
+----------
+This binary is not signed or notarised, so the first launch is refused. Either
+right-click it in Finder and choose Open, which offers a one-time exception, or
+strip the quarantine flag from a terminal:
+
+    xattr -d com.apple.quarantine erect
+
+Requirements
+------------
+Apple Silicon, macOS 11 or newer. Nothing else to install: audio goes through
+CoreAudio, gamepads through IOKit, both part of the system.
+
+Controls
+--------
+    Player 1   W A S D, SPACE to attack
+    Player 2   arrow keys, ENTER to attack
+    Gamepads   supported; pick a scheme per player in Settings
+    ESC        pause
+
+    move left/right   walk          jump   leave the ground
+    down while airborne             ground slam (puts up the wall)
+
+Settings and high scores go to
+~/Library/Application Support/erect/settings.json
+
+Licences
+--------
+E-Rect is GPL-3.0; the full text is in LICENSE. The music and sound effects are
+original work by the project author, under that same licence.
+
+The font is Tiny5 by the Tiny5 Project Authors, under the SIL Open Font License
+1.1. Its full text is in LICENSE-Tiny5.txt, alongside this file.
