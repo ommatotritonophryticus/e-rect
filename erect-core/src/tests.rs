@@ -5,6 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::config::*;
+use crate::dev::{DevSetup, DEV_MAX_SCORE, DEV_MAX_WAVE, DEV_SCORE_STEP};
 use crate::entities::*;
 use crate::game::{Game, State};
 use crate::geom::{Body, Viewport};
@@ -22,6 +23,11 @@ static TEST_SCHEMES: [SchemeInfo; 3] = [
 /// A platform that can only seat one player, like the PSP.
 static SINGLE_SCHEME: [SchemeInfo; 1] =
     [SchemeInfo { label: "PAD", is_gamepad: true, pad_index: 0 }];
+
+/// Colour for enemies a test builds by hand. In the game a plain enemy wears a
+/// player's colour; nothing under test cares which, so this keeps the call
+/// sites short and makes it obvious the value is arbitrary.
+const TEST_ENEMY_COLOR: crate::color::Rgb = crate::color::Rgb::new(200.0, 200.0, 200.0);
 
 fn new_game() -> Game {
     Game::new(
@@ -54,7 +60,7 @@ fn swing_at(game: &mut Game, player: usize, target: Body) {
     game.players[player].facing_right = true;
     game.players[player].attack_ticks = ATTACK_TICKS;
     let v = game.viewport;
-    game.players[player].update_gun(&v, 1.0);
+    game.players[player].update_gun(&v, 1.0, game.wave);
 }
 
 #[test]
@@ -97,7 +103,7 @@ fn each_player_scores_only_their_own_kills() {
     // Park P2 far away so it cannot be the one connecting.
     game.players[1].body.x = game.viewport.wper(300.0);
 
-    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng);
+    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
     z.hp = -1.0;
     let body = z.body;
     game.zombies.push(z);
@@ -128,7 +134,7 @@ fn boss_pays_boss_tier_but_runts_and_children_do_not() {
         game.players[0].score
     };
 
-    let base = Zombie::from_edge(&game.viewport, &mut game.rng);
+    let base = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
     let runt = Zombie::runt(&game.viewport, &mut game.rng);
     let boss = Zombie::boss(&game.viewport, 10, &mut game.rng);
     let parent = Zombie::splitter(&game.viewport, &mut game.rng);
@@ -153,7 +159,7 @@ fn armor_reduces_only_melee_damage() {
     let mut game = new_game();
     game.start_run(1);
 
-    let mut plain = Zombie::from_edge(&game.viewport, &mut game.rng);
+    let mut plain = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
     let mut armored = Zombie::armored(&game.viewport, &mut game.rng);
     plain.hp = 255.0;
     armored.hp = 255.0;
@@ -205,7 +211,7 @@ fn no_blast_can_hurt_anyone_any_more() {
     game.start_run(1);
     settle_on_floor(&mut game);
 
-    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng);
+    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
     z.hp = -1.0;
     let body = z.body;
     game.zombies.push(z);
@@ -274,7 +280,7 @@ fn swing_from_range(game: &mut Game, target_x: f32, target_y: f32) {
     game.players[0].body.y = target_y;
     game.players[0].facing_right = true;
     game.players[0].attack_ticks = ATTACK_TICKS;
-    game.players[0].update_gun(&v, 1.0);
+    game.players[0].update_gun(&v, 1.0, game.wave);
     assert!(
         !game.players[0].body.intersects(&Body::new(target_x, target_y, v.wper(5.0), v.hper(10.0))),
         "the point of this helper is that the bodies do not touch"
@@ -904,7 +910,7 @@ fn clear_arena(game: &mut Game) {
 fn hit_player_from(game: &mut Game, from_right: bool) -> f32 {
     let px = game.players[0].body.x;
     let v = game.viewport;
-    let mut z = Zombie::from_edge(&v, &mut game.rng);
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
     z.body.x = if from_right { px + v.wper(2.0) } else { px - v.wper(2.0) };
     z.body.y = game.players[0].body.y;
     z.hp = 9999.0;
@@ -1163,7 +1169,7 @@ fn a_straggler_is_brought_back_rather_than_left_to_stall_the_wave() {
     game.start_run(1);
     settle_on_floor(&mut game);
 
-    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng);
+    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
     z.body.x = game.players[0].body.x + game.viewport.w * 40.0;
     game.zombies.push(z);
     game.tick(&idle());
@@ -1389,7 +1395,7 @@ fn ground_enemies_follow_the_player_however_far_out_they_go() {
     game.players[0].body.x = far;
     game.camera_x = far - v.w / 2.0;
 
-    let mut z = Zombie::from_edge(&v, &mut game.rng);
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
     z.body.x = far - v.wper(40.0);
     z.body.y = game.players[0].body.y;
     game.zombies.push(z);
@@ -1600,12 +1606,17 @@ fn a_teleporter_blinks_away_the_first_time_it_is_hit_and_not_after() {
 
 /// Runs the wave manager on a given wave and reports the boss action it picks.
 fn boss_action_for(wave: i64) -> Option<WaveAction> {
+    boss_action_seeded(wave, 4242)
+}
+
+fn boss_action_seeded(wave: i64, seed: u64) -> Option<WaveAction> {
     let mut waves = WaveManager::default();
-    let mut rng = Rng::new(4242);
+    let mut rng = Rng::new(seed);
     for _ in 0..5000 {
         match waves.update(wave, 0, 0, &mut rng) {
             WaveAction::SpawnBosses(n) => return Some(WaveAction::SpawnBosses(n)),
             WaveAction::SpawnFlyingBoss => return Some(WaveAction::SpawnFlyingBoss),
+            WaveAction::SpawnShedderBoss => return Some(WaveAction::SpawnShedderBoss),
             _ => {}
         }
     }
@@ -1620,8 +1631,12 @@ fn wave_ten_belongs_to_the_flying_boss_and_the_others_keep_ground_bosses() {
         Some(WaveAction::SpawnFlyingBoss),
         "wave 10 should be the flying boss, not ground bosses"
     );
+    // Wave 15 is one or the other; see the shedder-boss test below.
+    assert!(matches!(
+        boss_action_for(SHEDDER_BOSS_WAVE),
+        Some(WaveAction::SpawnBosses(3)) | Some(WaveAction::SpawnShedderBoss)
+    ));
     // Past it, the ordinary boss waves carry on unchanged.
-    assert_eq!(boss_action_for(15), Some(WaveAction::SpawnBosses(3)));
     assert_eq!(boss_action_for(20), Some(WaveAction::SpawnBosses(4)));
     // And a non-boss wave still brings none.
     assert_eq!(boss_action_for(7), None);
@@ -2103,7 +2118,7 @@ fn a_no_wall_wave_buys_safety_instead_of_a_wall() {
     // Hits land on an untouchable player for nothing. The slam drives them down
     // hard, so the zombie has to follow for the few airborne ticks that remain.
     game.players[0].hp = 100.0;
-    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng);
+    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
     z.hp = 9999.0;
     z.hpmax = 9999.0;
     game.zombies.push(z);
@@ -2171,7 +2186,7 @@ fn a_blind_wave_makes_the_enemies_almost_harmless() {
 
     game.players[0].hp = 200.0;
     let p = game.players[0].body;
-    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng);
+    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
     z.body.x = p.x;
     z.body.y = p.y;
     z.hp = 9999.0;
@@ -2334,7 +2349,7 @@ fn energy_from_a_hit_at(hp: f32) -> i64 {
     game.players[0].energy = 0;
 
     let v = game.viewport;
-    let mut z = Zombie::from_edge(&v, &mut game.rng);
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
     z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
     z.body.x = game.players[0].body.x + v.wper(20.0);
     z.hp = 9999.0;
@@ -2385,7 +2400,7 @@ fn getting_hurt_does_not_pay_in_score() {
         game.players[0].score = 0;
 
         let v = game.viewport;
-        let mut z = Zombie::from_edge(&v, &mut game.rng);
+        let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
         z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
         z.body.x = game.players[0].body.x + v.wper(20.0);
         z.hp = 9999.0;
@@ -2472,4 +2487,1004 @@ fn dying_redraws_the_soundtrack_on_the_way_back_to_the_menu() {
     game.state = State::Title;
     game.tick(&idle());
     assert_ne!(game.audio_roll, in_run, "the menu after a death gets a new one");
+}
+
+/* ---------------- melee reach ---------------- */
+
+/// Width of a swinging player's melee box under the given conditions.
+fn gun_width(wave: i64, combo: u32, reach: f32) -> f32 {
+    let mut game = new_game();
+    game.start_run(1);
+    game.wave = wave;
+    game.players[0].combo = combo;
+    game.players[0].attack_ticks = ATTACK_TICKS;
+    let v = game.viewport;
+    game.players[0].update_gun(&v, reach, wave);
+    game.players[0].gun.w
+}
+
+#[test]
+fn the_attack_box_grows_linearly_with_the_wave() {
+    // Equal steps in the wave number are equal steps in reach. That is what
+    // separates this from the score-driven version it replaced, which was
+    // logarithmic in practice and had finished growing by wave 3.
+    let step_early = gun_width(5, 2, 1.0) - gun_width(1, 2, 1.0);
+    let step_late = gun_width(9, 2, 1.0) - gun_width(5, 2, 1.0);
+    assert!(
+        (step_early - step_late).abs() < 0.5,
+        "the ramp is not linear: {step_early} then {step_late}"
+    );
+}
+
+#[test]
+fn the_attack_box_stops_growing_at_the_ramp_wave() {
+    let at_ten = gun_width(GUN_RAMP_WAVES, 2, 1.0);
+    assert!(
+        at_ten > gun_width(GUN_RAMP_WAVES - 1, 2, 1.0),
+        "it should still be growing one wave short of the end"
+    );
+    for wave in [GUN_RAMP_WAVES + 1, 20, 40] {
+        assert_eq!(gun_width(wave, 2, 1.0), at_ten, "wave {wave} kept growing");
+    }
+}
+
+#[test]
+fn a_full_combo_at_the_ramp_wave_lands_exactly_on_the_ceiling() {
+    // The two constants are chosen to meet: the ramp ends where the clamp
+    // begins, so neither is doing work the other has already done.
+    let v = Viewport::new(1280.0, 800.0);
+    assert_eq!(gun_width(GUN_RAMP_WAVES, 2, 1.0), v.wper(GUN_MAX_REACH_PCT));
+}
+
+#[test]
+fn nothing_pushes_the_attack_box_past_the_ceiling() {
+    // A grounded wave doubles reach and a combo doubles it again; together on
+    // a late wave they would otherwise span most of the field.
+    let v = Viewport::new(1280.0, 800.0);
+    let ceiling = v.wper(GUN_MAX_REACH_PCT);
+    for wave in [1, 5, 10, 40] {
+        for combo in [0, 1, 2] {
+            for reach in [1.0, 2.0] {
+                let w = gun_width(wave, combo, reach);
+                assert!(w <= ceiling, "wave {wave} combo {combo} reach {reach} gave {w}");
+            }
+        }
+    }
+}
+
+/* ---------------- how many at once ---------------- */
+
+#[test]
+fn the_crowd_is_flat_while_the_roster_is_still_unlocking() {
+    // Waves 1-10 change what turns up, not how much of it; the last variant
+    // arrives on wave 9.
+    for wave in 1..CROWD_RAMP_FIRST_WAVE {
+        assert_eq!(
+            max_concurrent_enemies(wave),
+            MAX_CONCURRENT_ENEMIES,
+            "wave {wave} should still be at the opening figure"
+        );
+    }
+}
+
+#[test]
+fn the_crowd_grows_by_one_every_two_waves() {
+    assert_eq!(max_concurrent_enemies(CROWD_RAMP_FIRST_WAVE), MAX_CONCURRENT_ENEMIES + 1);
+    assert_eq!(max_concurrent_enemies(CROWD_RAMP_FIRST_WAVE + 1), MAX_CONCURRENT_ENEMIES + 1);
+    assert_eq!(max_concurrent_enemies(CROWD_RAMP_FIRST_WAVE + 2), MAX_CONCURRENT_ENEMIES + 2);
+    assert_eq!(max_concurrent_enemies(CROWD_RAMP_FIRST_WAVE + 3), MAX_CONCURRENT_ENEMIES + 2);
+
+    // Never falls, and never gains two at once.
+    let mut previous = max_concurrent_enemies(1);
+    for wave in 2..80 {
+        let now = max_concurrent_enemies(wave);
+        assert!(now >= previous, "the crowd shrank at wave {wave}");
+        assert!(now - previous <= 1, "the crowd jumped by more than one at wave {wave}");
+        previous = now;
+    }
+}
+
+#[test]
+fn the_crowd_stops_at_twice_the_opening_figure() {
+    let ceiling = MAX_CONCURRENT_ENEMIES * CROWD_MAX_MULTIPLE;
+    for wave in [29, 30, 60, 500] {
+        assert_eq!(max_concurrent_enemies(wave), ceiling, "wave {wave} went past the ceiling");
+    }
+}
+
+#[test]
+fn the_wave_manager_honours_the_growing_crowd() {
+    // The figure is no use if the spawner keeps its own copy of the old one.
+    let mut game = new_game();
+    let held = MAX_CONCURRENT_ENEMIES;
+
+    let mut spawned_at = |wave: i64, live: usize, game: &mut Game| {
+        let mut manager = WaveManager::default();
+        manager.skip_countdown();
+        manager.kind = WaveKind::GroundOnly;
+        let mut seen = 0;
+        for _ in 0..4000 {
+            manager.kind = WaveKind::GroundOnly;
+            if let WaveAction::SpawnGround(_) = manager.update(wave, 0, live, &mut game.rng) {
+                seen += 1;
+            }
+        }
+        seen
+    };
+
+    assert_eq!(spawned_at(1, held, &mut game), 0, "wave 1 should be full at the opening figure");
+    assert!(
+        spawned_at(CROWD_RAMP_FIRST_WAVE, held, &mut game) > 0,
+        "wave {CROWD_RAMP_FIRST_WAVE} should have room for one more"
+    );
+    assert_eq!(
+        spawned_at(CROWD_RAMP_FIRST_WAVE, held + 1, &mut game),
+        0,
+        "and no room beyond that"
+    );
+}
+
+/* ---------------- the wall against bosses ---------------- */
+
+/// Puts an active ultimate field over `body`, as if the player had slammed.
+fn raise_wall_over(game: &mut Game, body: Body) {
+    game.players[0].field.active = true;
+    game.players[0].field.body = body;
+}
+
+#[test]
+fn the_wall_takes_a_fixed_share_off_a_ground_boss() {
+    let mut game = new_game();
+    game.start_run(1);
+    game.wave = 5;
+    clear_arena(&mut game);
+
+    let mut boss = Zombie::boss(&game.viewport, game.wave, &mut game.rng);
+    boss.body.x = game.players[0].body.x;
+    boss.body.y = game.players[0].body.y;
+    let (full, body) = (boss.hpmax, boss.body);
+    game.zombies.push(boss);
+
+    raise_wall_over(&mut game, body);
+    game.tick(&idle());
+
+    let boss = game
+        .zombies
+        .iter()
+        .find(|z| z.is_boss)
+        .expect("the boss died to a single wall");
+    let taken = full - boss.hp;
+    assert!(
+        (taken - full * FIELD_BOSS_FRACTION).abs() < 1.0,
+        "a wall took {taken} off {full}, wanted a seventh"
+    );
+}
+
+#[test]
+fn the_wall_no_longer_ends_the_flying_boss_outright() {
+    // It used to be an instant kill whatever the health, which meant one
+    // charge finished the wave-10 boss while no number of walls could have
+    // finished a ground one.
+    let mut game = new_game();
+    game.start_run(1);
+    clear_arena(&mut game);
+
+    let size_ref = game.players[0].body;
+    let timer = game.timer;
+    let mut boss = Flyer::flying_boss(&game.viewport, &size_ref, timer, &mut game.rng);
+    boss.body.x = game.players[0].body.x;
+    boss.body.y = game.players[0].body.y;
+    let (full, body) = (boss.hpmax, boss.body);
+    game.flyers.push(boss);
+
+    raise_wall_over(&mut game, body);
+    game.tick(&idle());
+
+    let boss = game
+        .flyers
+        .iter()
+        .find(|f| f.is_boss)
+        .expect("one wall still ended it");
+    let taken = full - boss.hp;
+    assert!(
+        (taken - full * FIELD_BOSS_FRACTION).abs() < 1.0,
+        "a wall took {taken} off {full}, wanted a seventh"
+    );
+}
+
+#[test]
+fn the_wall_still_ends_anything_ordinary() {
+    let mut game = new_game();
+    game.start_run(1);
+    clear_arena(&mut game);
+
+    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.x = game.players[0].body.x;
+    z.body.y = game.players[0].body.y;
+    let body = z.body;
+    game.zombies.push(z);
+
+    raise_wall_over(&mut game, body);
+    // Two ticks: the death check runs at the top of the pass that applied the
+    // damage, so a kill is collected on the next one.
+    game.tick(&idle());
+    game.tick(&idle());
+    assert!(
+        !game.zombies.iter().any(|z| z.color == TEST_ENEMY_COLOR),
+        "the wall should still clear ordinary enemies outright"
+    );
+}
+
+/* ---------------- enemy colour ---------------- */
+
+#[test]
+fn plain_enemies_wear_a_player_colour() {
+    // Colour is the only thing telling variants apart, so a base enemy rolling
+    // its own out of the same range could turn up dressed as a jumper.
+    let mut game = new_game();
+    game.start_run(2);
+    let wanted: Vec<_> = game.players.iter().map(|p| p.color).collect();
+
+    game.waves.skip_countdown();
+    for _ in 0..900 {
+        // Held every tick: the manager re-rolls the kind when a wave turns over.
+        game.waves.kind = WaveKind::BasicOnly;
+        game.tick(&idle());
+        if game.zombies.len() >= 6 {
+            break;
+        }
+    }
+    assert!(!game.zombies.is_empty(), "no plain enemies ever spawned");
+    for z in game.zombies.iter() {
+        assert!(
+            wanted.contains(&z.color),
+            "a plain enemy wore {:?}, which belongs to no player",
+            z.color
+        );
+    }
+}
+
+/* ---------------- dash ---------------- */
+
+fn dash_input() -> InputFrame {
+    let mut input = idle();
+    input.players[0].dash = true;
+    input
+}
+
+/// A run with the player standing still on the floor, facing right.
+fn ready_to_dash(game: &mut Game) {
+    game.start_run(1);
+    settle_on_floor(game);
+    game.players[0].facing_right = true;
+    game.players[0].dash_cooldown = 0;
+    // Enough to pay without being enough to buy a charge on the way past.
+    game.players[0].energy = game.players[0].energy_needed(game.wave) - 1;
+}
+
+#[test]
+fn a_dash_never_steps_further_than_a_body() {
+    // The shove is a per-tick overlap test, so a step longer than an enemy is
+    // wide would carry the player clean through one without ever touching it.
+    // This is what pins DASH_TICKS to its floor.
+    let v = Viewport::new(1280.0, 800.0);
+    let step = v.wper(DASH_DISTANCE_PCT) / DASH_TICKS as f32;
+    let body = v.wper(5.0);
+    assert!(step <= body, "a step of {step} skips past a {body}-wide enemy");
+}
+
+#[test]
+fn a_dash_carries_the_player_the_whole_distance() {
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+
+    let from = game.players[0].body.x;
+    game.tick(&dash_input());
+    for _ in 0..DASH_TICKS {
+        clear_arena(&mut game);
+        game.tick(&idle());
+    }
+    let travelled = game.players[0].body.x - from;
+    let want = game.viewport.wper(DASH_DISTANCE_PCT);
+    assert!(
+        (travelled - want).abs() < game.viewport.wper(2.0),
+        "dashed {travelled}, wanted about {want}"
+    );
+}
+
+#[test]
+fn the_cooldown_locks_out_a_second_dash() {
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    game.players[0].energy = 100_000; // never the reason it refuses
+    clear_arena(&mut game);
+
+    game.tick(&dash_input());
+    assert!(game.players[0].dashing());
+
+    // Let the dash run its course.
+    for _ in 0..DASH_TICKS {
+        clear_arena(&mut game);
+        game.tick(&idle());
+    }
+    assert!(!game.players[0].dashing(), "the dash should be over");
+    assert!(game.players[0].dash_cooldown > 0, "and the cooldown should be running");
+
+    // Pressing inside the cooldown is refused, however hard.
+    while game.players[0].dash_cooldown > 0 {
+        clear_arena(&mut game);
+        game.tick(&dash_input());
+        assert!(!game.players[0].dashing(), "the cooldown let a dash through");
+    }
+
+    // And the first press after it works.
+    clear_arena(&mut game);
+    game.tick(&dash_input());
+    assert!(game.players[0].dashing(), "it should go again once the cooldown is out");
+}
+
+#[test]
+fn a_dash_costs_a_third_of_a_bar() {
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+
+    let needed = game.players[0].energy_needed(game.wave);
+    let before = game.players[0].energy;
+    let want_cost = (needed + 2) / 3;
+
+    game.tick(&dash_input());
+    assert_eq!(before - game.players[0].energy, want_cost);
+}
+
+#[test]
+fn an_empty_bar_breaks_a_charge_without_discounting_the_next_one() {
+    // Breaking a charge has to count as spending one. The next charge is priced
+    // on how many are held, so quietly dropping one would make the fallback
+    // cheaper than paying properly.
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+    game.players[0].energy = 0;
+    game.players[0].super_charges = 1;
+    game.players[0].attacks_since_power_up = 0;
+    let price_before = game.players[0].energy_needed(game.wave);
+
+    game.tick(&dash_input());
+
+    assert!(game.players[0].dashing(), "a held charge should have paid for it");
+    assert_eq!(game.players[0].super_charges, 0);
+    assert_eq!(
+        game.players[0].energy_needed(game.wave),
+        price_before,
+        "breaking a charge must not discount the next one"
+    );
+    // The change from the broken charge stays on the bar.
+    assert_eq!(game.players[0].energy, price_before - (price_before + 2) / 3);
+}
+
+#[test]
+fn a_dash_with_nothing_to_pay_with_does_nothing() {
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+    game.players[0].energy = 0;
+    game.players[0].super_charges = 0;
+
+    let from = game.players[0].body.x;
+    game.tick(&dash_input());
+    assert!(!game.players[0].dashing());
+    assert!((game.players[0].body.x - from).abs() < 1.0, "it moved anyway");
+}
+
+#[test]
+fn a_dash_throws_enemies_clear_and_hurts_nobody() {
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
+    z.body.x = game.players[0].body.x + v.wper(10.0);
+    let hp_before = z.hp;
+    game.zombies.push(z);
+    game.flyers.clear();
+    let player_hp = game.players[0].hp;
+
+    // Long enough for the dash to reach it.
+    game.tick(&dash_input());
+    for _ in 0..DASH_TICKS {
+        game.tick(&idle());
+    }
+
+    let z = &game.zombies[0];
+    assert!(z.ay < 0.0, "the enemy should have been thrown upward");
+    assert_eq!(z.hp, hp_before, "a dash must not damage what it shoves");
+    assert_eq!(game.players[0].hp, player_hp, "and must not cost the player health");
+}
+
+#[test]
+fn a_husk_still_hurts_a_dashing_player() {
+    // The husk is the one thing a dash cannot shove: it takes no damage and
+    // does not move, which makes it the counter to the crowd-clear.
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+    game.flyers.clear();
+
+    let v = game.viewport;
+    let mut parent = Zombie::shedder(&v, &mut game.rng);
+    parent.body.x = game.players[0].body.x + v.wper(200.0);
+    let mut husk = game.players[0].body;
+    husk.x = game.players[0].body.x + v.wper(10.0);
+    parent.husks.push(husk);
+    game.zombies.push(parent);
+
+    let hp_before = game.players[0].hp;
+    game.tick(&dash_input());
+    for _ in 0..DASH_TICKS {
+        game.tick(&idle());
+    }
+    assert!(game.players[0].hp < hp_before, "a husk should still bite mid-dash");
+}
+
+#[test]
+fn the_melee_box_is_red_when_the_dash_is_spent_and_white_when_ready() {
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+
+    let ready = game.players[0].gun_color();
+    assert_eq!(ready, crate::color::Rgb::new(255.0, 255.0, 255.0), "a ready dash reads white");
+    assert!(!game.players[0].attacking(), "and it is the idle box being read");
+
+    game.tick(&dash_input());
+    for _ in 0..DASH_TICKS {
+        clear_arena(&mut game);
+        game.tick(&idle());
+    }
+    let spent = game.players[0].gun_color();
+    assert!(spent.g < 32.0 && spent.b < 32.0, "it should be red the moment the dash ends");
+
+    // And it walks back to white rather than snapping.
+    let mut previous = spent.g;
+    for _ in 0..DASH_COOLDOWN_TICKS {
+        clear_arena(&mut game);
+        game.tick(&idle());
+        let now = game.players[0].gun_color().g;
+        assert!(now >= previous, "the indicator went backwards");
+        previous = now;
+    }
+    assert_eq!(game.players[0].gun_color(), crate::color::Rgb::new(255.0, 255.0, 255.0));
+}
+
+#[test]
+fn a_swing_is_always_white_however_spent_the_dash_is() {
+    // Mid-attack the box is what the player reads for reach. Recolouring it
+    // then would say two things with one shape at the moment it matters most.
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+
+    game.tick(&dash_input());
+    for _ in 0..DASH_TICKS {
+        clear_arena(&mut game);
+        game.tick(&idle());
+    }
+    assert!(game.players[0].dash_cooldown > 0, "the dash should be on cooldown");
+    assert!(game.players[0].gun_color().g < 64.0, "idle, it should be showing red");
+
+    game.players[0].attack_ticks = ATTACK_TICKS;
+    assert_eq!(
+        game.players[0].gun_color(),
+        crate::color::Rgb::new(255.0, 255.0, 255.0),
+        "a swing must stay white even with the dash spent"
+    );
+}
+
+/* ---------------- the developer menu ---------------- */
+
+fn dev_chord() -> InputFrame {
+    InputFrame { dev_menu: true, ..Default::default() }
+}
+
+#[test]
+fn the_dev_menu_opens_from_the_title_and_nowhere_else() {
+    let mut game = new_game();
+    game.tick(&dev_chord());
+    assert_eq!(game.state, State::DevMenu, "the chord should open it from the title");
+
+    // Not from inside settings, where it would be a surprise.
+    let mut game = new_game();
+    game.state = State::Settings;
+    game.tick(&dev_chord());
+    assert_eq!(game.state, State::Settings);
+
+    // Nor from a run: the chord is Select and Down on a PSP, and Down is a
+    // button the player is holding all the time.
+    let mut game = new_game();
+    game.start_run(1);
+    game.tick(&dev_chord());
+    assert_eq!(game.state, State::Playing);
+}
+
+#[test]
+fn a_dev_run_starts_on_the_wave_and_score_it_was_given() {
+    let mut game = new_game();
+    game.dev.wave = 17;
+    game.dev.score = 12_500;
+    game.dev.players = 1;
+    game.start_dev_run();
+
+    assert_eq!(game.state, State::Playing);
+    assert_eq!(game.wave, 17);
+    assert_eq!(game.total_score(), 12_500, "the team total should be what the menu showed");
+}
+
+#[test]
+fn the_score_row_steps_by_five_hundred_and_stops_at_both_ends() {
+    let mut dev = DevSetup::default();
+    dev.adjust_score(1);
+    assert_eq!(dev.score, DEV_SCORE_STEP);
+    dev.adjust_score(1);
+    assert_eq!(dev.score, DEV_SCORE_STEP * 2);
+    dev.adjust_score(-1);
+    assert_eq!(dev.score, DEV_SCORE_STEP);
+
+    for _ in 0..5 {
+        dev.adjust_score(-1);
+    }
+    assert_eq!(dev.score, 0, "score should not go negative");
+
+    for _ in 0..5000 {
+        dev.adjust_score(1);
+    }
+    assert_eq!(dev.score, DEV_MAX_SCORE, "score should stop at its ceiling");
+}
+
+#[test]
+fn the_wave_row_stops_at_one() {
+    let mut dev = DevSetup::default();
+    for _ in 0..5 {
+        dev.adjust_wave(-1);
+    }
+    assert_eq!(dev.wave, 1);
+    for _ in 0..500 {
+        dev.adjust_wave(1);
+    }
+    assert_eq!(dev.wave, DEV_MAX_WAVE);
+}
+
+#[test]
+fn the_modifier_rows_cycle_back_through_any() {
+    let mut dev = DevSetup::default();
+    assert_eq!(dev.kind, None, "they start unpinned");
+    assert_eq!(dev.kind_label(), "ANY");
+
+    let mut seen_pinned = false;
+    for _ in 0..6 {
+        dev.cycle_kind(1);
+        seen_pinned |= dev.kind.is_some();
+    }
+    assert!(seen_pinned, "cycling never pinned anything");
+    assert_eq!(dev.kind, None, "a full cycle should come back to ANY");
+
+    // Backwards too, and the labels never come out blank.
+    dev.cycle_rule(-1);
+    assert!(dev.rule.is_some());
+    assert!(!dev.rule_label().is_empty());
+}
+
+#[test]
+fn pinned_modifiers_hold_for_every_wave_of_the_run() {
+    let mut game = new_game();
+    game.dev.wave = 3;
+    game.dev.kind = Some(WaveKind::FlyersOnly);
+    game.dev.rule = Some(WaveRule::NoJumps);
+    game.start_dev_run();
+
+    assert_eq!(game.waves.kind, WaveKind::FlyersOnly);
+    assert_eq!(game.waves.rule, WaveRule::NoJumps);
+
+    // Every later wave settles the same way, however the dice fall.
+    for wave in 4..30 {
+        game.waves.begin_wave(wave, &mut game.rng);
+        assert_eq!(game.waves.kind, WaveKind::FlyersOnly, "wave {wave} lost the pin");
+        assert_eq!(game.waves.rule, WaveRule::NoJumps, "wave {wave} lost the pin");
+    }
+}
+
+#[test]
+fn an_ordinary_run_never_inherits_the_pins() {
+    let mut game = new_game();
+    game.dev.kind = Some(WaveKind::BasicOnly);
+    game.dev.rule = Some(WaveRule::Hidden);
+    game.start_dev_run();
+    assert_eq!(game.waves.forced_kind, Some(WaveKind::BasicOnly));
+
+    // Back to the menu, then a normal start.
+    game.start_run(1);
+    assert_eq!(game.waves.forced_kind, None, "a normal run kept a pinned kind");
+    assert_eq!(game.waves.forced_rule, None, "a normal run kept a pinned rule");
+}
+
+#[test]
+fn a_dev_run_honours_the_platform_player_limit() {
+    // A PSP seats one, so asking for two must not produce a second player who
+    // has no controller.
+    let mut game = single_player_platform();
+    game.dev.players = 2;
+    game.start_dev_run();
+    assert_eq!(game.players.len(), 1);
+}
+
+/* ---------------- the shedder ---------------- */
+
+/// Drops a shedder on the ground just to the right of player 0 and returns the
+/// body it is standing in.
+fn plant_shedder(game: &mut Game) -> Body {
+    let v = game.viewport;
+    let mut z = Zombie::shedder(&v, &mut game.rng);
+    z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
+    z.body.x = game.players[0].body.x + v.wper(6.0);
+    let body = z.body;
+    game.zombies.push(z);
+    body
+}
+
+fn the_shedder(game: &Game) -> &Zombie {
+    game.zombies
+        .iter()
+        .find(|z| z.behavior == Behavior::Shedder)
+        .expect("the shedder is gone")
+}
+
+#[test]
+fn the_shedder_waits_for_its_wave() {
+    let mut game = new_game();
+    for wave in 1..SHEDDER_MIN_WAVE {
+        for _ in 0..500 {
+            assert_ne!(
+                pick_ground(wave, &mut game.rng),
+                GroundKind::Shedder,
+                "a shedder turned up on wave {wave}"
+            );
+        }
+    }
+    let mut seen = false;
+    for _ in 0..2000 {
+        if pick_ground(SHEDDER_MIN_WAVE, &mut game.rng) == GroundKind::Shedder {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "the shedder never turned up on its own wave");
+}
+
+#[test]
+fn a_hurt_shedder_lands_beyond_the_longest_reach() {
+    // The whole point of it: a hit cannot be followed up, however far the
+    // player's reach has ramped.
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    let body = plant_shedder(&mut game);
+
+    swing_at(&mut game, 0, body);
+    game.tick(&idle());
+
+    let v = game.viewport;
+    let player = game.players[0].body.center_x();
+    let gap = (the_shedder(&game).body.center_x() - player).abs();
+    assert!(
+        gap > v.wper(GUN_MAX_REACH_PCT),
+        "it landed {gap} away, inside the {} ceiling",
+        v.wper(GUN_MAX_REACH_PCT)
+    );
+}
+
+#[test]
+fn a_hurt_shedder_leaves_a_husk_where_the_hit_landed() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    let body = plant_shedder(&mut game);
+
+    swing_at(&mut game, 0, body);
+    game.tick(&idle());
+
+    let husks = &the_shedder(&game).husks;
+    assert_eq!(husks.len(), 1, "a hit should leave exactly one husk");
+    assert!(
+        (husks[0].x - body.x).abs() < 1.0 && (husks[0].y - body.y).abs() < 1.0,
+        "the husk is not where the hit was"
+    );
+}
+
+#[test]
+fn an_ordinary_shedder_keeps_only_the_last_husk() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    plant_shedder(&mut game);
+
+    for _ in 0..4 {
+        let body = the_shedder(&game).body;
+        // Chase it down: it is out of reach after every hit.
+        game.players[0].body.x = body.x - game.players[0].body.w;
+        swing_at(&mut game, 0, body);
+        game.tick(&idle());
+        assert_eq!(
+            the_shedder(&game).husks.len(),
+            SHEDDER_HUSKS,
+            "an ordinary shedder should replace its husk, not add to it"
+        );
+    }
+}
+
+#[test]
+fn a_husk_hurts_on_contact() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    plant_shedder(&mut game);
+    game.flyers.clear();
+
+    let over_player = game.players[0].body;
+    let k = game
+        .zombies
+        .iter()
+        .position(|z| z.behavior == Behavior::Shedder)
+        .unwrap();
+    game.zombies[k].husks.push(over_player);
+
+    let before = game.players[0].hp;
+    game.tick(&idle());
+    assert!(game.players[0].hp < before, "standing in a husk should hurt");
+}
+
+#[test]
+fn a_husk_cannot_be_hurt_back() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    plant_shedder(&mut game);
+
+    let v = game.viewport;
+    let k = game
+        .zombies
+        .iter()
+        .position(|z| z.behavior == Behavior::Shedder)
+        .unwrap();
+    let mut husk = game.zombies[k].body;
+    husk.x = game.players[0].body.x + v.wper(8.0);
+    game.zombies[k].husks.push(husk);
+    // The parent goes far off, or the swings below would land on it instead and
+    // it would replace the husk under test with a fresh one.
+    game.zombies[k].body.x = husk.x + v.wper(300.0);
+
+    for _ in 0..6 {
+        swing_at(&mut game, 0, husk);
+        game.tick(&idle());
+    }
+    assert_eq!(
+        the_shedder(&game).husks.iter().filter(|h| h.x == husk.x).count(),
+        1,
+        "swinging at a husk should not remove it"
+    );
+}
+
+#[test]
+fn husks_go_when_their_parent_does() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    let body = plant_shedder(&mut game);
+
+    let k = game
+        .zombies
+        .iter()
+        .position(|z| z.behavior == Behavior::Shedder)
+        .unwrap();
+    game.zombies[k].husks.push(body);
+    // One swing's worth of health left. An enemy is only ever collected inside
+    // a hit, so setting health negative on its own would leave it standing.
+    game.zombies[k].hp = 1.0;
+
+    swing_at(&mut game, 0, body);
+    // The kill is collected on the pass after the one that did the damage.
+    game.tick(&idle());
+    game.tick(&idle());
+
+    assert!(
+        !game.zombies.iter().any(|z| z.behavior == Behavior::Shedder),
+        "the shedder should be gone"
+    );
+    assert!(
+        game.zombies.iter().all(|z| z.husks.is_empty()),
+        "a husk outlived its parent"
+    );
+}
+
+#[test]
+fn husks_do_not_hold_a_wave_open() {
+    // They are scenery, so they must not count towards the live-enemy total
+    // the wave manager waits on.
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    let body = plant_shedder(&mut game);
+
+    let k = game
+        .zombies
+        .iter()
+        .position(|z| z.behavior == Behavior::Shedder)
+        .unwrap();
+    for _ in 0..5 {
+        game.zombies[k].husks.push(body);
+    }
+    let live = game.zombies.len() + game.flyers.len();
+    assert_eq!(live, 1, "husks are being counted as enemies");
+}
+
+#[test]
+fn the_shedder_boss_borrows_the_first_boss_health_and_keeps_every_husk() {
+    let mut game = new_game();
+    let v = game.viewport;
+    let boss = Zombie::shedder_boss(&v, &mut game.rng);
+    let plain = Zombie::boss(&v, SHEDDER_BOSS_HEALTH_WAVE, &mut game.rng);
+
+    assert!(boss.is_boss);
+    assert_eq!(boss.behavior, Behavior::Shedder);
+    assert_eq!(boss.hpmax, plain.hpmax, "it should keep the first boss's health");
+    assert!(boss.max_husks > SHEDDER_HUSKS, "the boss should not replace its husks");
+}
+
+#[test]
+fn wave_fifteen_rolls_between_two_bosses() {
+    let (mut ground, mut shedder) = (false, false);
+    for seed in 0..80u64 {
+        match boss_action_seeded(SHEDDER_BOSS_WAVE, seed) {
+            Some(WaveAction::SpawnBosses(_)) => ground = true,
+            Some(WaveAction::SpawnShedderBoss) => shedder = true,
+            other => panic!("wave 15 produced {other:?}"),
+        }
+        if ground && shedder {
+            break;
+        }
+    }
+    assert!(ground && shedder, "wave 15 only ever produced one of the two");
+}
+
+/* ---------------- the drift behind the menus ---------------- */
+
+#[test]
+fn the_view_drifts_behind_the_menus() {
+    // Nothing else moves on the title screen, so without this the parallax
+    // skyline is a still image.
+    let mut game = new_game();
+    let start = game.camera_x;
+    for _ in 0..10 {
+        game.tick(&idle());
+    }
+    let moved = (game.camera_x - start).abs();
+    let want = 10.0 * game.viewport.wper(PLAYER_MOVE_PCT * MENU_CAMERA_DRIFT);
+    assert!(
+        (moved - want).abs() < 0.01,
+        "drifted {moved}, wanted {want} ({MENU_CAMERA_DRIFT} of a walk)"
+    );
+}
+
+#[test]
+fn the_drift_is_slower_than_a_player_walks() {
+    let mut game = new_game();
+    let start = game.camera_x;
+    game.tick(&idle());
+    let drift = (game.camera_x - start).abs();
+    let walk = game.viewport.wper(PLAYER_MOVE_PCT);
+    assert!(drift < walk, "the menu should drift, not travel");
+}
+
+#[test]
+fn the_drift_direction_is_redrawn_on_every_arrival() {
+    let mut game = new_game();
+    let (mut left, mut right) = (false, false);
+    for _ in 0..60 {
+        // Leaving and coming back is what re-rolls it; the arrival is spotted
+        // by comparing against the previous tick's state, so the run has to
+        // actually tick before the title can be returned to.
+        game.start_run(1);
+        game.tick(&idle());
+        game.state = State::Title;
+        game.tick(&idle());
+
+        let before = game.camera_x;
+        game.tick(&idle());
+        match game.camera_x - before {
+            d if d > 0.0 => right = true,
+            d if d < 0.0 => left = true,
+            _ => panic!("the view stopped drifting"),
+        }
+        if left && right {
+            break;
+        }
+    }
+    assert!(left && right, "the drift only ever went one way");
+}
+
+#[test]
+fn the_run_itself_still_follows_the_players() {
+    // The drift must not leak into a run, where the camera has a job.
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.camera_x = 0.0;
+    let want = game.players[0].body.center_x() - game.viewport.w / 2.0;
+    for _ in 0..200 {
+        clear_arena(&mut game);
+        game.tick(&idle());
+    }
+    assert!(
+        (game.camera_x - want).abs() < game.viewport.wper(2.0),
+        "the camera did not settle on the player"
+    );
+}
+
+/* ---------------- knockback ---------------- */
+
+#[test]
+fn a_hit_throws_a_ground_enemy_at_walking_pace() {
+    // It used to scale with the enemy's own health, so a boss travelled three
+    // times as far from a hit as a runt did.
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
+    z.body.x = game.players[0].body.x + v.wper(6.0);
+    z.hp = 9999.0;
+    z.hpmax = 9999.0;
+    let body = z.body;
+    game.zombies.push(z);
+    game.flyers.clear();
+
+    swing_at(&mut game, 0, body);
+    game.tick(&idle());
+
+    let thrown = game.zombies[0].ax.abs();
+    assert!(
+        (thrown - v.wper(PLAYER_MOVE_PCT)).abs() < 0.01,
+        "thrown at {thrown}, wanted a walk of {}",
+        v.wper(PLAYER_MOVE_PCT)
+    );
+}
+
+/* ---------------- the background ---------------- */
+
+#[test]
+fn the_background_says_whether_a_wave_is_running() {
+    let mut game = new_game();
+    for _ in 0..120 {
+        game.tick(&idle());
+    }
+    let quiet = game.background.to_rgb();
+    assert!(quiet.g > quiet.r, "a quiet screen should be the green one");
+
+    game.start_run(1);
+    game.waves.skip_countdown();
+    for _ in 0..600 {
+        game.tick(&idle());
+        if !game.zombies.is_empty() || !game.flyers.is_empty() {
+            break;
+        }
+    }
+    for _ in 0..120 {
+        game.tick(&idle());
+    }
+    let fighting = game.background.to_rgb();
+    assert!(fighting.r > fighting.g, "a running wave should be the red one");
 }

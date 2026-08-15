@@ -13,6 +13,7 @@ pub struct PlayerIntent {
     pub jump: bool,
     pub slam: bool,
     pub attack: bool,
+    pub dash: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,6 +31,10 @@ pub struct InputFrame {
     pub players: [PlayerIntent; MAX_PLAYERS],
     pub menu: MenuIntent,
     pub pause: bool,
+    /// Opens the developer menu from the title screen. A deliberately awkward
+    /// chord on every platform: nothing behind it should be reachable by a
+    /// player who was not looking for it.
+    pub dev_menu: bool,
     /// Drives the "(OFF)" marker on the settings screen.
     pub pads_connected: [bool; MAX_PLAYERS],
 }
@@ -42,8 +47,10 @@ impl InputFrame {
             p.jump = false;
             p.slam = false;
             p.attack = false;
+            p.dash = false;
         }
         self.menu = MenuIntent::default();
         self.pause = false;
+        self.dev_menu = false;
     }
 }

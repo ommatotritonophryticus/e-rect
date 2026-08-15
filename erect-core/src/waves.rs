@@ -27,6 +27,8 @@ pub enum GroundKind {
     Splitter,
     Blinker,
     Shooter,
+    /// Blinks out of reach when hurt and leaves a standing hazard where it was.
+    Shedder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,7 +37,7 @@ pub enum FlyerKind {
     Teleporter,
 }
 
-pub const GROUND_SPAWN_TABLE: [SpawnEntry; 9] = [
+pub const GROUND_SPAWN_TABLE: [SpawnEntry; 10] = [
     SpawnEntry {
         weight: 6,
         min_wave: 1,
@@ -80,6 +82,11 @@ pub const GROUND_SPAWN_TABLE: [SpawnEntry; 9] = [
         weight: 2,
         min_wave: 9,
         kind: GroundKind::Shooter,
+    },
+    SpawnEntry {
+        weight: 2,
+        min_wave: crate::config::SHEDDER_MIN_WAVE,
+        kind: GroundKind::Shedder,
     },
 ];
 
@@ -264,6 +271,9 @@ pub enum WaveAction {
     SpawnBosses(i64),
     /// Wave 10's single flying boss, in place of that wave's ground bosses.
     SpawnFlyingBoss,
+    /// Wave 15's alternative: one shedder boss instead of that wave's three
+    /// ground bosses. Rolled, so the wave is not the same fight every run.
+    SpawnShedderBoss,
     ClearWave,
 }
 
@@ -271,6 +281,10 @@ pub struct WaveManager {
     /// What kind of wave is running. Rolled when a wave begins.
     pub kind: WaveKind,
     pub rule: WaveRule,
+    /// Pinned by the developer menu. `None` leaves the roll alone, which is
+    /// what every ordinary run uses.
+    pub forced_kind: Option<WaveKind>,
+    pub forced_rule: Option<WaveRule>,
     boss_due: bool,
     /// -1 when no countdown is running, otherwise the number still displayed.
     pub countdown: i32,
@@ -283,6 +297,8 @@ impl Default for WaveManager {
         Self {
             kind: WaveKind::Mixed,
             rule: WaveRule::Normal,
+            forced_kind: None,
+            forced_rule: None,
             boss_due: true,
             countdown: -1,
             countdown_timer: 0,
@@ -292,8 +308,13 @@ impl Default for WaveManager {
 }
 
 impl WaveManager {
+    /// Back to a fresh run. The pinned modifiers survive on purpose: they are
+    /// set before the run starts and are meant to hold for all of it.
     pub fn reset(&mut self) {
+        let (kind, rule) = (self.forced_kind, self.forced_rule);
         *self = Self::default();
+        self.forced_kind = kind;
+        self.forced_rule = rule;
     }
 
     /// Ends the lull immediately; the next wave starts spawning at once.
@@ -314,8 +335,11 @@ impl WaveManager {
 
     /// Decides what the upcoming wave will be made of.
     pub fn begin_wave(&mut self, wave: i64, rng: &mut Rng) {
-        self.kind = WaveKind::roll(wave, rng);
-        self.rule = WaveRule::roll(wave, rng);
+        // Both rolls happen either way, pinned or not, so that pinning one does
+        // not shift the stream the rest of the run draws from.
+        let (kind, rule) = (WaveKind::roll(wave, rng), WaveRule::roll(wave, rng));
+        self.kind = self.forced_kind.unwrap_or(kind);
+        self.rule = self.forced_rule.unwrap_or(rule);
     }
 
     /// Advances pacing by one tick and reports what should happen.
@@ -351,6 +375,11 @@ impl WaveManager {
                     // every other boss wave keeps its ground bosses.
                     return if wave == crate::config::FLYING_BOSS_WAVE {
                         WaveAction::SpawnFlyingBoss
+                    } else if wave == crate::config::SHEDDER_BOSS_WAVE && rng.flip() {
+                        // A coin flip rather than a fixed owner: wave 10 always
+                        // belongs to the flying boss, but this wave is worth
+                        // being two different fights.
+                        WaveAction::SpawnShedderBoss
                     } else {
                         WaveAction::SpawnBosses(wave / 5)
                     };
@@ -361,7 +390,7 @@ impl WaveManager {
 
             self.spawn_timer = rng.range(6, 60);
 
-            if live_enemies < crate::config::MAX_CONCURRENT_ENEMIES {
+            if live_enemies < crate::config::max_concurrent_enemies(wave) {
                 return match self.kind {
                     // A restricted wave spawns on every opportunity; the coin
                     // flips below are what make a mixed wave feel sparse, and

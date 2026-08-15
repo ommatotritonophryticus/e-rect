@@ -24,7 +24,10 @@ struct PadState {
     cross: bool,
     square: bool,
     circle: bool,
+    triangle: bool,
     start: bool,
+    /// Only ever a modifier: nothing in the game itself is bound to it.
+    select: bool,
 }
 
 pub struct Input {
@@ -67,7 +70,9 @@ impl Input {
             cross: b.contains(CtrlButtons::CROSS),
             square: b.contains(CtrlButtons::SQUARE),
             circle: b.contains(CtrlButtons::CIRCLE),
+            triangle: b.contains(CtrlButtons::TRIANGLE),
             start: b.contains(CtrlButtons::START),
+            select: b.contains(CtrlButtons::SELECT),
         };
 
         let pressed = |now: bool, before: bool| now && !before;
@@ -86,6 +91,7 @@ impl Input {
             // Slam is Circle or d-pad down, whichever the player reaches for.
             slam: pressed(c.circle, p.circle) || pressed(c.down, p.down),
             attack: pressed(c.square, p.square),
+            dash: pressed(c.triangle, p.triangle),
         };
 
         frame.menu = MenuIntent {
@@ -97,6 +103,9 @@ impl Input {
             back: pressed(c.circle, p.circle),
         };
         frame.pause = pressed(c.start, p.start);
+        // Select held, then Down. A chord rather than a button, and Select is
+        // not used for anything else, so it cannot be hit while playing.
+        frame.dev_menu = c.select && pressed(c.down, p.down);
 
         frame
     }

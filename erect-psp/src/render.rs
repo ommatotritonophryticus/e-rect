@@ -58,6 +58,7 @@ pub unsafe fn render(game: &Game) {
                 render_session(game)
             }
             State::Settings => render_settings(game),
+            State::DevMenu => render_dev_menu(game),
             State::Title => render_title(game),
         }
 
@@ -137,6 +138,15 @@ unsafe fn render_settings(game: &Game) {
     }
 }
 
+unsafe fn render_dev_menu(game: &Game) {
+    unsafe {
+        let v = &game.viewport;
+        centered("DEV", 14.0, v.hper(9.0), WHITE, game);
+        render_menu(game, game.dev_menu.index, game.dev_menu.top_pct);
+        centered("LEFT/RIGHT CHANGE   O BACK", 92.0, v.hper(4.5), GREY, game);
+    }
+}
+
 unsafe fn render_menu(game: &Game, selected: usize, top_pct: f32) {
     unsafe {
         let v = &game.viewport;
@@ -206,12 +216,20 @@ unsafe fn render_session(game: &Game) {
             actor(&body, gfx::pack(p.color.shaded(p.hp / 255.0)), ow, oh);
             let gun = on_screen(&p.gun, cam);
             gfx::rect(gun.x, gun.y - oh, gun.w + ow, gun.h + oh * 2.0, BLACK);
-            gfx::rect(gun.x, gun.y, gun.w, gun.h, WHITE);
+            gfx::rect(gun.x, gun.y, gun.w, gun.h, gfx::pack(p.gun_color()));
         }
 
         // A blind wave hides the enemies themselves; the player, its attacks,
         // the blasts and the popups are all that is left to fight by.
         if game.waves.rule != WaveRule::Hidden {
+            // Husks first, so a shedder standing on one of its own is the thing
+            // in front. They take their parent's colour darkened, which says
+            // whose they are without a second entry in the palette.
+            for z in game.zombies.iter() {
+                for husk in z.husks.iter() {
+                    actor(&on_screen(husk, cam), gfx::pack(z.color.shaded(HUSK_SHADE)), ow, oh);
+                }
+            }
             for z in game.zombies.iter() {
                 actor(&on_screen(&z.body, cam), gfx::pack(z.color.shaded(z.hp / z.hpmax)), ow, oh);
             }

@@ -29,6 +29,15 @@ pub enum MenuAction {
     /// Leaving the game is the platform's business, so the core only records
     /// that it was asked for.
     Quit,
+
+    /* developer menu */
+    AdjustDevWave,
+    AdjustDevScore,
+    AdjustDevKind,
+    AdjustDevRule,
+    AdjustDevPlayers,
+    /// Begin a run on the parameters set above.
+    StartDevRun,
 }
 
 pub struct MenuRow {
@@ -45,6 +54,11 @@ impl MenuRow {
             MenuAction::AdjustScheme(_)
                 | MenuAction::AdjustColor(_)
                 | MenuAction::AdjustVolume(_)
+                | MenuAction::AdjustDevWave
+                | MenuAction::AdjustDevScore
+                | MenuAction::AdjustDevKind
+                | MenuAction::AdjustDevRule
+                | MenuAction::AdjustDevPlayers
         )
     }
 }

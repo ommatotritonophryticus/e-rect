@@ -151,6 +151,7 @@ impl Renderer {
                 self.render_session(game)
             }
             State::Settings => self.render_settings(game, pads_connected),
+            State::DevMenu => self.render_dev_menu(game, pads_connected),
             State::Title => self.render_title(game, pads_connected),
         }
 
@@ -227,6 +228,17 @@ impl Renderer {
         self.draw_centered(v, "ESC OR B TO GO BACK", 83.0, size, hint);
     }
 
+    fn render_dev_menu(&self, game: &Game, pads_connected: [bool; MAX_PLAYERS]) {
+        let v = &game.viewport;
+        self.draw_centered_shadowed(v, "DEV", 16.0, v.hper(8.0), WHITE);
+        self.render_menu(game, &game.dev_menu, pads_connected);
+
+        let hint = Color::new(0.78, 0.78, 0.78, 1.0);
+        let size = v.hper(3.5);
+        self.draw_centered(v, "LEFT / RIGHT TO CHANGE", 84.0, size, hint);
+        self.draw_centered(v, "ESC OR B TO GO BACK", 89.0, size, hint);
+    }
+
     fn render_session(&self, game: &Game) {
         let v = &game.viewport;
         let cam = game.camera_x;
@@ -259,13 +271,21 @@ impl Renderer {
                 gun.h + v.hper(0.2),
                 BLACK,
             );
-            draw_rectangle(gun.x, gun.y, gun.w, gun.h, WHITE);
+            draw_rectangle(gun.x, gun.y, gun.w, gun.h, mq(player.gun_color()));
         }
 
         // A blind wave hides the enemies themselves. The player, its attacks,
         // the blasts and the score popups all stay: those are the only things
         // left to read the fight by.
         if game.waves.rule != WaveRule::Hidden {
+            // Husks first, so a shedder standing on one of its own is the thing
+            // in front. They take their parent's colour darkened, which is what
+            // says whose they are without a second entry in the palette.
+            for z in game.zombies.iter() {
+                for husk in z.husks.iter() {
+                    self.draw_actor(v, &on_screen(husk, cam), mq(z.color.shaded(HUSK_SHADE)));
+                }
+            }
             for z in game.zombies.iter() {
                 self.draw_actor(v, &on_screen(&z.body, cam), mq(z.color.shaded(z.hp / z.hpmax)));
             }

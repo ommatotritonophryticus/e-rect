@@ -6,6 +6,7 @@
 //! keeps every enemy a plain value that can live in a `Vec`.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::color::Rgb;
 use crate::config::*;
@@ -38,6 +39,13 @@ pub struct Player {
     pub super_charges: i64,
     pub attacks_since_power_up: i64,
 
+    /// Ticks of dash still to travel; zero when not dashing.
+    pub dash_ticks: i32,
+    /// Which way the dash in progress is going, +1 or -1.
+    pub dash_dir: f32,
+    /// Ticks until another dash may start. Also drives the indicator.
+    pub dash_cooldown: i32,
+
     pub grounded: bool,
     pub facing_right: bool,
     pub attack_ticks: i32,
@@ -67,6 +75,9 @@ impl Player {
             energy: 0,
             super_charges: 1,
             attacks_since_power_up: 0,
+            dash_ticks: 0,
+            dash_dir: 1.0,
+            dash_cooldown: 0,
             grounded: false,
             facing_right: true,
             attack_ticks: 0,
@@ -88,6 +99,9 @@ impl Player {
         self.knockback_x = 0.0;
         self.hp = 255.0;
         self.kills = 0;
+        self.dash_ticks = 0;
+        self.dash_dir = 1.0;
+        self.dash_cooldown = 0;
         self.grounded = false;
         self.facing_right = true;
         self.attack_ticks = 0;
@@ -112,11 +126,45 @@ impl Player {
         self.invulnerable = false;
         self.knockback_x = 0.0;
         self.attack_ticks = 0;
+        self.dash_ticks = 0;
+        self.dash_cooldown = 0;
         self.field = UltimateField::default();
     }
 
     pub fn attacking(&self) -> bool {
         self.attack_ticks > 0
+    }
+
+    pub fn dashing(&self) -> bool {
+        self.dash_ticks > 0
+    }
+
+    /// Colour of the melee box.
+    ///
+    /// At rest that box sits inside the body, offset to whichever way the
+    /// player faces - it is already the direction indicator, so it is where the
+    /// dash cooldown belongs too rather than on a second square competing with
+    /// it. Red the instant a dash ends, easing back to white as the cooldown
+    /// runs out.
+    ///
+    /// A swing is always white. Mid-attack the box is what the player reads for
+    /// reach, and recolouring it then would be saying two things with one
+    /// shape at the moment it matters most.
+    ///
+    /// Worked out here rather than in each renderer, so the two frontends
+    /// cannot drift apart on what it means.
+    pub fn gun_color(&self) -> Rgb {
+        if self.attacking() {
+            return Rgb::new(255.0, 255.0, 255.0);
+        }
+        let left = if DASH_COOLDOWN_TICKS > 0 {
+            (self.dash_cooldown as f32 / DASH_COOLDOWN_TICKS as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Red stays full; the other two channels come back up as it recovers.
+        let rest = 255.0 * (1.0 - left);
+        Rgb::new(255.0, rest, rest)
     }
 
     /// Never 0: a zero threshold would blank the HUD bar and let charges
@@ -127,10 +175,10 @@ impl Player {
         (raw as i64).max(1)
     }
 
-    /// Melee box position/size; widens with score and doubles on a full combo.
-    /// `reach` scales the attack box; a grounded wave doubles it to make up for
-    /// the mobility the player lost.
-    pub fn update_gun(&mut self, v: &Viewport, reach: f32) {
+    /// Melee box position/size; widens with the wave and doubles on a full
+    /// combo. `reach` scales the attack box; a grounded wave doubles it to make
+    /// up for the mobility the player lost.
+    pub fn update_gun(&mut self, v: &Viewport, reach: f32, wave: i64) {
         let b = self.body;
         self.gun.h = b.h / 2.0;
         if !self.attacking() {
@@ -141,12 +189,16 @@ impl Player {
                 b.x + v.wper(0.5)
             };
         } else {
-            let extra = v.wper(self.score as f32 / 100.0).min(b.w * 2.0);
+            let ramp = wave.clamp(1, GUN_RAMP_WAVES) as f32 / GUN_RAMP_WAVES as f32;
+            let extra = v.wper(GUN_EXTRA_MAX_PCT) * ramp;
             self.gun.w = if self.combo == 2 {
                 (b.w + extra) * 2.0 * reach
             } else {
                 (b.w + extra) * reach
             };
+            // Reach and the combo each double the box; both at once on a late
+            // wave would otherwise span the field.
+            self.gun.w = self.gun.w.min(v.wper(GUN_MAX_REACH_PCT));
             self.gun.x = if self.facing_right {
                 b.x + b.w
             } else {
@@ -195,6 +247,13 @@ impl UltimateField {
  * Enemies
  * ------------------------------------------------------------------ */
 
+/// The shedder's signature colour.
+///
+/// Green is the one hue no other variant claims. The husks it leaves are drawn
+/// in the same colour darkened, so the pair reads as one thing without costing
+/// a second entry in an already crowded palette.
+pub const SHEDDER_COLOR: Rgb = Rgb::new(90.0, 200.0, 90.0);
+
 /// Per-variant behaviour, replacing the JS `onTick` closures.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Behavior {
@@ -216,6 +275,13 @@ pub enum Behavior {
         /// While true the trajectory is locked and the chase logic leaves it be.
         airborne: bool,
     },
+    /// Walks like anything else until it is hurt, then leaves a husk standing
+    /// where it was hit and reappears out of melee range.
+    ///
+    /// Unlike a blinker this happens on *every* hit, not once - the exchange is
+    /// meant to be a trade rather than an opening. The player gets the damage
+    /// in and gets a hazard to work around for it.
+    Shedder,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +305,17 @@ pub struct Zombie {
     /// Where a shooter's sight points, in world coordinates. Kept across ticks
     /// so the last stretch before the shot can be locked and dodged.
     pub aim: Option<(f32, f32)>,
+
+    /// Standing hazards this enemy has left behind, in world coordinates.
+    ///
+    /// Owned by the enemy rather than kept in a list of their own, which gets
+    /// three of the rules for free: they vanish when it dies, they never count
+    /// towards the live-enemy total that decides when a wave is over, and no
+    /// identity has to be tracked to tell whose is whose.
+    pub husks: Vec<Body>,
+    /// How many husks may stand at once. One for an ordinary shedder, so a new
+    /// one replaces the last; effectively unbounded for the boss.
+    pub max_husks: usize,
 }
 
 /// One dot of a shooter's sight. A dotted line because both renderers can only
@@ -269,17 +346,19 @@ impl Zombie {
             behavior: Behavior::None,
             hurt_once: false,
             aim: None,
+            husks: Vec::new(),
+            max_husks: 0,
         }
     }
 
     /// Placed just past the left or right edge of the view. The x is relative
     /// to the view; the caller shifts it into the world by adding the camera.
-    pub fn from_edge(v: &Viewport, rng: &mut Rng) -> Self {
-        let color = Rgb::new(
-            rng.range(100, 255) as f32,
-            rng.range(100, 255) as f32,
-            rng.range(100, 255) as f32,
-        );
+    ///
+    /// The colour comes from the caller rather than a roll here. Every variant
+    /// has a signature colour and colour is the only thing telling them apart,
+    /// so a base enemy drawing at random out of the same range could turn up
+    /// wearing a jumper's orange and lie to the player about what it does.
+    pub fn from_edge(v: &Viewport, rng: &mut Rng, color: Rgb) -> Self {
         let x = if rng.flip() {
             -v.wper(5.0)
         } else {
@@ -320,8 +399,7 @@ impl Zombie {
     }
 
     pub fn runt(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(255.0, 220.0, 80.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(255.0, 220.0, 80.0));
         z.body.w *= RUNT_SIZE_SCALE;
         z.body.h *= RUNT_SIZE_SCALE;
         z.hp = RUNT_HP;
@@ -332,8 +410,7 @@ impl Zombie {
 
     /// Winds up on the spot, then throws itself at the player.
     pub fn leaper(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(255.0, 90.0, 200.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(255.0, 90.0, 200.0));
         z.behavior = Behavior::Leaper {
             crouch: LEAPER_CROUCH_TICKS,
             airborne: false,
@@ -342,8 +419,7 @@ impl Zombie {
     }
 
     pub fn jumper(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(255.0, 140.0, 0.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(255.0, 140.0, 0.0));
         // staggered so a group of jumpers does not move in lockstep
         z.behavior = Behavior::Jumper {
             cooldown: rng.range(0, JUMPER_JUMP_EVERY),
@@ -352,22 +428,19 @@ impl Zombie {
     }
 
     pub fn armored(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(150.0, 150.0, 160.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(150.0, 150.0, 160.0));
         z.armor = ARMORED_ARMOR;
         z
     }
 
     pub fn frenzied(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(180.0, 20.0, 20.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(180.0, 20.0, 20.0));
         z.enrages = true;
         z
     }
 
     pub fn splitter(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(170.0, 60.0, 220.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(170.0, 60.0, 220.0));
         z.splits_into = SPLITTER_CHILD_COUNT;
         z
     }
@@ -375,15 +448,31 @@ impl Zombie {
     /// Refuses to be fought where it stands: touch it, or land the first hit on
     /// it, and it leaves a blast behind and reappears at the edge of the field.
     pub fn blinker(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(220.0, 40.0, 40.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(220.0, 40.0, 40.0));
         z.behavior = Behavior::Blinker;
         z
     }
 
+    /// Refuses to be traded with: every hit sends it out of reach and leaves a
+    /// husk standing where the hit landed.
+    pub fn shedder(v: &Viewport, rng: &mut Rng) -> Self {
+        let mut z = Self::from_edge(v, rng, SHEDDER_COLOR);
+        z.behavior = Behavior::Shedder;
+        z.max_husks = SHEDDER_HUSKS;
+        z
+    }
+
+    /// The wave-15 boss: a shedder that keeps every husk it leaves, with the
+    /// first boss's health rather than its own wave's.
+    pub fn shedder_boss(v: &Viewport, rng: &mut Rng) -> Self {
+        let mut z = Self::boss(v, SHEDDER_BOSS_HEALTH_WAVE, rng);
+        z.behavior = Behavior::Shedder;
+        z.max_husks = SHEDDER_BOSS_HUSKS;
+        z
+    }
+
     pub fn shooter(v: &Viewport, rng: &mut Rng) -> Self {
-        let mut z = Self::from_edge(v, rng);
-        z.color = Rgb::new(60.0, 200.0, 220.0);
+        let mut z = Self::from_edge(v, rng, Rgb::new(60.0, 200.0, 220.0));
         z.behavior = Behavior::Shooter {
             cooldown: rng.range(0, SHOOTER_FIRE_EVERY),
         };

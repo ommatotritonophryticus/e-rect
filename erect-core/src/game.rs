@@ -14,6 +14,7 @@ use crate::audio::{AudioEvent, AudioQueue, MusicState, Situation};
 use crate::backdrop::BackdropBlock;
 use crate::color::{EaseColor, Rgb};
 use crate::config::*;
+use crate::dev::DevSetup;
 use crate::entities::*;
 use crate::geom::{Body, Viewport};
 use crate::input::InputFrame;
@@ -25,6 +26,8 @@ use crate::waves::{FlyerKind, GroundKind, WaveAction, WaveManager, WaveRule};
 pub enum State {
     Title,
     Settings,
+    /// Starting parameters for a run, reached by a chord from the title.
+    DevMenu,
     Playing,
     Paused,
     /// "Are you sure?" over the paused game. Its own state rather than a flag,
@@ -81,6 +84,10 @@ pub struct Game {
     pub settings_menu: Menu,
     pub pause_menu: Menu,
     pub confirm_menu: Menu,
+    pub dev_menu: Menu,
+    /// What the developer menu will start a run on. Kept across visits so a
+    /// wave can be tried, died on, and tried again without retyping it.
+    pub dev: DevSetup,
 
     /// Control schemes this platform offers, supplied by the frontend.
     pub schemes: &'static [SchemeInfo],
@@ -97,6 +104,9 @@ pub struct Game {
     /// frontend picks its sound pack from this, so the core never has to know
     /// how many packs exist or what they are called.
     pub audio_roll: u64,
+    /// Which way the view slides behind the menus, +1 or -1. Re-rolled on every
+    /// arrival at the title, so the screen is not the same one twice.
+    menu_drift: f32,
     /// Previous state, only so the arrival at the title can be spotted once
     /// rather than every tick it stays there.
     last_state: State,
@@ -106,8 +116,21 @@ pub struct Game {
     audio_rng: Rng,
 }
 
+/* ---------------- background ---------------- */
+
+// One flat colour behind everything, eased between three settings. It is the
+// largest area on screen and the only always-visible read on what the game is
+// doing.
+
+/// A wave is running.
 const BG_FIGHT: Rgb = Rgb::new(240.0, 50.0, 20.0);
-const BG_CLEAR: Rgb = Rgb::new(80.0, 255.0, 130.0);
+
+/// The lull between waves. Blue rather than the green it used to be, which
+/// leaves green to mean the menu and nothing else.
+const BG_CALM: Rgb = Rgb::new(80.0, 255.0, 130.0);
+
+/// Menus and the title.
+const BG_MENU: Rgb = Rgb::new(80.0, 255.0, 130.0);
 
 impl Game {
     pub fn new(
@@ -136,7 +159,7 @@ impl Game {
             result: None,
             quit_requested: false,
             result_ticks: 0,
-            background: EaseColor::new(BG_CLEAR),
+            background: EaseColor::new(BG_MENU),
             timer: 0,
             wave: 1,
             spawn_count: 0,
@@ -145,15 +168,21 @@ impl Game {
             settings_menu: Menu::new(26.0),
             pause_menu: Menu::new(48.0),
             confirm_menu: Menu::new(52.0),
+            dev_menu: Menu::new(26.0),
+            dev: DevSetup::default(),
             schemes,
             max_players,
             camera_x: 0.0,
             backdrop_seed: seed ^ 0xB5AD_4ECE_DA1C_E2A9,
             audio_roll: seed,
+            menu_drift: 1.0,
             last_state: State::Title,
             audio_rng: Rng::new(seed ^ 0x243F_6A88_85A3_08D3),
         };
         game.start_new_run(1);
+        // start_new_run arms the sky for play, but nothing is being played yet -
+        // the game opens on the title screen, which owns its own colour.
+        game.background = EaseColor::new(BG_MENU);
         game
     }
 
@@ -200,8 +229,14 @@ impl Game {
 
     /// Draws a new soundtrack. The value means nothing here; a frontend maps it
     /// onto whichever packs it shipped.
+    ///
+    /// The menu's drift direction is drawn here too, from the same generator:
+    /// both are cosmetic, both belong to an arrival at the title, and both must
+    /// stay out of the run's own stream or a new soundtrack would reshuffle
+    /// every wave after it.
     fn roll_audio(&mut self) {
         self.audio_roll = self.audio_rng.next_seed();
+        self.menu_drift = if self.audio_rng.flip() { 1.0 } else { -1.0 };
     }
 
     /// What the music should be doing right now.
@@ -246,7 +281,7 @@ impl Game {
             player.reset(&self.viewport, spawn_x);
             self.players.push(player);
         }
-        self.background = EaseColor::new(BG_CLEAR);
+        self.background = EaseColor::new(BG_CALM);
         self.zombies.clear();
         self.flyers.clear();
         self.explosions.clear();
@@ -259,9 +294,44 @@ impl Game {
         self.waves.reset();
     }
 
+    /// Opens the developer menu, and clears whatever the last visit pinned so
+    /// it cannot leak into a run started from the ordinary menu.
+    fn open_dev_menu(&mut self) {
+        self.state = State::DevMenu;
+        self.dev_menu.index = 0;
+    }
+
+    /// Starts a run on the developer menu's parameters.
+    ///
+    /// All of it is applied *after* `start_new_run`, which resets the players
+    /// and the wave manager - anything set before would be quietly undone.
+    pub fn start_dev_run(&mut self) {
+        let count = self.dev.players.clamp(1, self.max_players);
+        self.start_new_run(count);
+
+        self.wave = self.dev.wave.max(1);
+        // The whole score goes to the first player, so the team total is the
+        // number the menu was showing.
+        if let Some(p) = self.players.first_mut() {
+            p.score = self.dev.score;
+        }
+
+        self.waves.forced_kind = self.dev.kind;
+        self.waves.forced_rule = self.dev.rule;
+        // Settle the opening wave again now the pins are in: start_new_run
+        // decided it without them, and on a different wave number.
+        let wave = self.wave;
+        self.waves.begin_wave(wave, &mut self.rng);
+
+        self.state = State::Playing;
+    }
+
     pub fn start_run(&mut self, player_count: usize) {
         let player_count = player_count.clamp(1, self.max_players);
         self.start_new_run(player_count);
+        // An ordinary run never inherits the developer menu's pins.
+        self.waves.forced_kind = None;
+        self.waves.forced_rule = None;
         self.state = State::Playing;
     }
 
@@ -279,7 +349,7 @@ impl Game {
     fn on_wave_cleared(&mut self) {
         self.wave += 1;
         self.spawn_count = 0;
-        self.background.set_target(BG_CLEAR);
+        self.background.set_target(BG_CALM);
         let count = self.players.len();
         for i in 0..count {
             self.players[i].kills = 0;
@@ -366,6 +436,15 @@ impl Game {
     /// players who walked apart would end up off opposite edges.
     fn update_camera(&mut self) {
         let v = self.viewport;
+
+        // Behind a menu there is nobody to follow, so the view drifts instead.
+        // The skyline is parallaxed off the camera, which makes this the only
+        // thing standing between the title screen and a still image.
+        if matches!(self.state, State::Title | State::Settings | State::DevMenu) {
+            self.camera_x += self.menu_drift * v.wper(PLAYER_MOVE_PCT * MENU_CAMERA_DRIFT);
+            return;
+        }
+
         if self.players.is_empty() {
             return;
         }
@@ -415,6 +494,38 @@ impl Game {
         self.camera_x += (target - self.camera_x) * CAMERA_FOLLOW;
     }
 
+    /// The colour a plain enemy wears: one of the players', picked at random
+    /// when there are two of them.
+    ///
+    /// Base enemies used to roll their own out of 100..=255 on every channel -
+    /// the same range the variants' signature colours live in - so one could
+    /// arrive wearing a jumper's orange and lie to the player about what it was
+    /// going to do. Colour is the only thing telling enemies apart here, which
+    /// makes that the whole vocabulary being undermined. A player's colour can
+    /// never be mistaken for a variant, and it is already on screen.
+    fn plain_enemy_color(&mut self) -> Rgb {
+        match self.players.len() {
+            0 => Rgb::new(255.0, 255.0, 255.0),
+            1 => self.players[0].color,
+            n => {
+                let pick = self.rng.range(0, n as i32 - 1).clamp(0, n as i32 - 1) as usize;
+                self.players[pick].color
+            }
+        }
+    }
+
+    /// The sky the run itself wants: daylight in the lull, combat while a wave
+    /// is up. Called when a menu closes and gives the sky back.
+    fn restore_wave_sky(&mut self) {
+        let quiet =
+            self.waves.between_waves() || (self.zombies.is_empty() && self.flyers.is_empty());
+        if quiet {
+            self.background.set_target(BG_CALM);
+        } else {
+            self.background.set_target(BG_FIGHT);
+        }
+    }
+
     /// Fills `out` with one skyline layer and returns the colour to draw it in.
     ///
     /// Layers come farthest first, so a renderer that walks them in order gets
@@ -457,6 +568,32 @@ impl Game {
         };
         let scale = 1.0 + ENERGY_DESPERATION_BONUS * (1.0 - ratio);
         self.players[pi].energy += libm::roundf(amount as f32 * scale) as i64;
+    }
+
+    /// Takes the price of a dash out of the energy bar, breaking a charge if the
+    /// bar is short. Returns false when neither can pay.
+    ///
+    /// Breaking a charge counts as spending one, exactly as the wall does. Skip
+    /// that and the fallback would be *cheaper* than paying properly: the next
+    /// charge is priced on how many are held, so quietly dropping one would
+    /// discount it.
+    fn pay_for_dash(&mut self, i: usize) -> bool {
+        let needed = self.players[i].energy_needed(self.wave);
+        // Integer ceiling, so a third of a bar is never rounded down to free.
+        let cost = ((needed + DASH_COST_DIVISOR - 1) / DASH_COST_DIVISOR).max(1);
+
+        if self.players[i].energy >= cost {
+            self.players[i].energy -= cost;
+            return true;
+        }
+        if self.players[i].super_charges > 0 {
+            self.players[i].super_charges -= 1;
+            self.players[i].attacks_since_power_up += 1;
+            // A charge is worth a full bar; the dash comes out of the change.
+            self.players[i].energy = (self.players[i].energy + needed - cost).max(0);
+            return true;
+        }
+        false
     }
 
     /// Applies one hit to a player: scaling, invulnerability, knockback and the
@@ -519,13 +656,38 @@ impl Game {
         if self.state == State::Title && self.last_state != State::Title {
             self.roll_audio();
         }
+        // The menus own the sky while they are up, and hand it back to whatever
+        // the wave logic last asked for on the way out. Set from the state each
+        // tick rather than at every transition into and out of a menu, because
+        // there are six such transitions and only one of them is obvious.
+        match self.state {
+            State::Title | State::Settings | State::DevMenu => {
+                self.background.set_target(BG_MENU)
+            }
+            _ if matches!(
+                self.last_state,
+                State::Title | State::Settings | State::DevMenu
+            ) =>
+            {
+                self.restore_wave_sky();
+            }
+            _ => {}
+        }
         self.last_state = self.state;
 
         self.background.approach(10.0);
 
         match self.state {
-            State::Title | State::Settings => {
+            State::Title | State::Settings | State::DevMenu => {
+                // A chord from the title, and only from the title: it must not
+                // be reachable from inside settings or a paused run.
+                if input.dev_menu && self.state == State::Title {
+                    self.open_dev_menu();
+                }
                 self.handle_menu_input(input);
+                // Nothing else moves here, so the drift is the whole of what
+                // makes the screen behind the menu alive.
+                self.update_camera();
             }
             State::Paused => {
                 if input.pause {
@@ -629,6 +791,43 @@ impl Game {
                 MenuRow { label: "NO".to_string(), action: MenuAction::KeepPlaying, swatch: None },
                 MenuRow { label: "YES".to_string(), action: MenuAction::AbandonRun, swatch: None },
             ],
+            State::DevMenu => vec![
+                MenuRow {
+                    label: format!("WAVE: {}", self.dev.wave),
+                    action: MenuAction::AdjustDevWave,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("SCORE: {}", self.dev.score),
+                    action: MenuAction::AdjustDevScore,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("KIND: {}", self.dev.kind_label()),
+                    action: MenuAction::AdjustDevKind,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("RULE: {}", self.dev.rule_label()),
+                    action: MenuAction::AdjustDevRule,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("PLAYERS: {}", self.dev.players.min(self.max_players)),
+                    action: MenuAction::AdjustDevPlayers,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: "START".to_string(),
+                    action: MenuAction::StartDevRun,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: "BACK".to_string(),
+                    action: MenuAction::Back,
+                    swatch: None,
+                },
+            ],
             State::Settings => {
                 let mut rows = Vec::new();
                 for i in 0..self.max_players {
@@ -706,6 +905,7 @@ impl Game {
     fn current_menu_mut(&mut self) -> &mut Menu {
         match self.state {
             State::Settings => &mut self.settings_menu,
+            State::DevMenu => &mut self.dev_menu,
             State::Paused => &mut self.pause_menu,
             State::ConfirmAbandon => &mut self.confirm_menu,
             _ => &mut self.title_menu,
@@ -720,6 +920,7 @@ impl Game {
     fn selected_action(&self) -> Option<MenuAction> {
         let menu = match self.state {
             State::Settings => &self.settings_menu,
+            State::DevMenu => &self.dev_menu,
             State::Paused => &self.pause_menu,
             State::ConfirmAbandon => &self.confirm_menu,
             _ => &self.title_menu,
@@ -733,6 +934,11 @@ impl Game {
             Some(MenuAction::AdjustScheme(i)) => self.settings.cycle(i, true, dir, self.schemes.len()),
             Some(MenuAction::AdjustColor(i)) => self.settings.cycle(i, false, dir, self.schemes.len()),
             Some(MenuAction::AdjustVolume(ch)) => self.settings.adjust_volume(ch, dir),
+            Some(MenuAction::AdjustDevWave) => self.dev.adjust_wave(dir),
+            Some(MenuAction::AdjustDevScore) => self.dev.adjust_score(dir),
+            Some(MenuAction::AdjustDevKind) => self.dev.cycle_kind(dir),
+            Some(MenuAction::AdjustDevRule) => self.dev.cycle_rule(dir),
+            Some(MenuAction::AdjustDevPlayers) => self.dev.adjust_players(dir, self.max_players),
             _ => {}
         }
     }
@@ -752,6 +958,12 @@ impl Game {
             Some(MenuAction::AdjustScheme(i)) => self.settings.cycle(i, true, 1, self.schemes.len()),
             Some(MenuAction::AdjustColor(i)) => self.settings.cycle(i, false, 1, self.schemes.len()),
             Some(MenuAction::AdjustVolume(ch)) => self.settings.adjust_volume(ch, 1),
+            Some(MenuAction::AdjustDevWave) => self.dev.adjust_wave(1),
+            Some(MenuAction::AdjustDevScore) => self.dev.adjust_score(1),
+            Some(MenuAction::AdjustDevKind) => self.dev.cycle_kind(1),
+            Some(MenuAction::AdjustDevRule) => self.dev.cycle_rule(1),
+            Some(MenuAction::AdjustDevPlayers) => self.dev.adjust_players(1, self.max_players),
+            Some(MenuAction::StartDevRun) => self.start_dev_run(),
             Some(MenuAction::Quit) => self.quit_requested = true,
             Some(MenuAction::Resume) => self.toggle_pause(),
             Some(MenuAction::StartWave) => {
@@ -788,10 +1000,10 @@ impl Game {
 
             // Movement is held state, so it is simply mirrored each tick.
             if intent.left && !intent.right {
-                self.players[i].ax = -v.wper(1.0);
+                self.players[i].ax = -v.wper(PLAYER_MOVE_PCT);
                 self.players[i].facing_right = false;
             } else if intent.right && !intent.left {
-                self.players[i].ax = v.wper(1.0);
+                self.players[i].ax = v.wper(PLAYER_MOVE_PCT);
                 self.players[i].facing_right = true;
             } else {
                 self.players[i].ax = 0.0;
@@ -833,6 +1045,16 @@ impl Game {
                     _ => {}
                 }
             }
+            // Committed once it starts: no steering, no second dash out of the
+            // first, and the direction is whichever way the player is facing.
+            if intent.dash
+                && !self.players[i].dashing()
+                && self.players[i].dash_cooldown == 0
+                && self.pay_for_dash(i)
+            {
+                self.players[i].dash_ticks = DASH_TICKS;
+                self.players[i].dash_dir = if self.players[i].facing_right { 1.0 } else { -1.0 };
+            }
             if intent.attack && !self.players[i].attacking() {
                 let timer = self.timer;
                 let p = &mut self.players[i];
@@ -857,7 +1079,8 @@ impl Game {
                 continue;
             }
             let reach = self.waves.rule.gun_reach();
-            self.players[i].update_gun(&v, reach);
+            let wave = self.wave;
+            self.players[i].update_gun(&v, reach, wave);
             if self.players[i].field.active {
                 let body = self.players[i].body;
                 self.players[i].field.grow(&v, &body);
@@ -926,8 +1149,9 @@ impl Game {
             WaveAction::SpawnGround(kind) => {
                 self.background.set_target(BG_FIGHT);
                 self.spawn_count += 1;
+                let plain = self.plain_enemy_color();
                 let z = match kind {
-                    GroundKind::Base => Zombie::from_edge(&v, &mut self.rng),
+                    GroundKind::Base => Zombie::from_edge(&v, &mut self.rng, plain),
                     GroundKind::Runt => Zombie::runt(&v, &mut self.rng),
                     GroundKind::Jumper => Zombie::jumper(&v, &mut self.rng),
                     GroundKind::Leaper => Zombie::leaper(&v, &mut self.rng),
@@ -936,6 +1160,7 @@ impl Game {
                     GroundKind::Splitter => Zombie::splitter(&v, &mut self.rng),
                     GroundKind::Blinker => Zombie::blinker(&v, &mut self.rng),
                     GroundKind::Shooter => Zombie::shooter(&v, &mut self.rng),
+                    GroundKind::Shedder => Zombie::shedder(&v, &mut self.rng),
                 };
                 let mut z = z;
                 z.body.x += self.camera_x;
@@ -953,6 +1178,13 @@ impl Game {
                 let mut f = f;
                 f.body.x += self.camera_x;
                 self.flyers.push(f);
+            }
+            WaveAction::SpawnShedderBoss => {
+                self.background.set_target(BG_FIGHT);
+                self.spawn_count += 1;
+                let mut boss = Zombie::shedder_boss(&v, &mut self.rng);
+                boss.body.x += self.camera_x;
+                self.zombies.push(boss);
             }
             WaveAction::SpawnFlyingBoss => {
                 self.background.set_target(BG_FIGHT);
@@ -1017,11 +1249,27 @@ impl Game {
         // from the pad every tick, so knockback has to live on its own.
         // The field has no ends, so nothing stops horizontal travel. What keeps
         // a co-op pair together is the leash in `update_camera`, not a wall.
-        let dx = self.players[i].ax + self.players[i].knockback_x;
+        //
+        // A dash is a third channel, and it overrides the other two rather than
+        // adding to them: holding back during one should not shorten it. It
+        // cannot ride on `knockback_x` either, because that is wiped on every
+        // tick spent touching the ground.
+        let dx = if self.players[i].dashing() {
+            self.players[i].dash_ticks -= 1;
+            if self.players[i].dash_ticks == 0 {
+                self.players[i].dash_cooldown = DASH_COOLDOWN_TICKS;
+            }
+            self.players[i].dash_dir * v.wper(DASH_DISTANCE_PCT) / DASH_TICKS as f32
+        } else {
+            self.players[i].ax + self.players[i].knockback_x
+        };
         self.players[i].body.x += dx;
         self.players[i].knockback_x *= KNOCKBACK_DECAY;
         if libm::fabsf(self.players[i].knockback_x) < 0.01 {
             self.players[i].knockback_x = 0.0;
+        }
+        if self.players[i].dash_cooldown > 0 {
+            self.players[i].dash_cooldown -= 1;
         }
 
         let needed = self.players[i].energy_needed(self.wave);
@@ -1076,7 +1324,16 @@ impl Game {
 
             if let Some((attacker, by_field)) = self.find_attacker(&self.zombies[i].body) {
                 if by_field {
-                    self.zombies[i].hp -= 255.0;
+                    // A boss loses a fixed share of its health, so a wall is
+                    // worth the same against a wave-25 boss as a wave-5 one.
+                    // Anything ordinary is simply finished: subtracting a flat
+                    // 255 left a full-health enemy at exactly zero, which is
+                    // not below zero and so not dead.
+                    if self.zombies[i].is_boss {
+                        self.zombies[i].hp -= self.zombies[i].hpmax * FIELD_BOSS_FRACTION;
+                    } else {
+                        self.zombies[i].hp = -1.0;
+                    }
                 }
                 let first_hit = !self.zombies[i].hurt_once;
                 self.zombies[i].hurt_once = true;
@@ -1133,10 +1390,27 @@ impl Game {
                 let attacker_x = self.players[attacker].body.x;
                 let dir = if zx > attacker_x { 1.0 } else { -1.0 };
                 self.zombies[i].ay = -v.hper(2.0);
-                self.zombies[i].ax =
-                    dir * (v.wper(0.5) + v.wper(0.1) * self.zombies[i].hpmax / 255.0);
-                let armor = self.zombies[i].armor;
-                self.zombies[i].hp -= 64.0 * armor;
+                // Thrown off at exactly walking pace, whatever it is. It
+                // used to scale with the enemy's own health, which made a boss
+                // travel three times as far from a hit as a runt did.
+                self.zombies[i].ax = dir * v.wper(PLAYER_MOVE_PCT);
+                // Only a swing does swing damage. The wall reaching an enemy
+                // used to add this on top of its own, which was invisible while
+                // the wall dealt a flat 255 - the 64 was what actually took an
+                // ordinary enemy from exactly zero to dead - but it would make
+                // a boss lose a seventh plus a hit.
+                if !by_field {
+                    let armor = self.zombies[i].armor;
+                    self.zombies[i].hp -= 64.0 * armor;
+                }
+
+                // Every hit it lives through sends it out of reach, leaving a
+                // husk standing where the hit landed. Checked after the damage
+                // so the hit actually counts, and gated on surviving so the
+                // killing blow does not send a corpse across the field.
+                if self.zombies[i].behavior == Behavior::Shedder && self.zombies[i].hp >= 0.0 {
+                    self.shed_and_flee(i);
+                }
             }
 
             for e in 0..self.explosions.len() {
@@ -1156,9 +1430,19 @@ impl Game {
                 if self.players[pi].dead {
                     continue;
                 }
+                let dashing = self.players[pi].dashing();
                 let p = &self.players[pi];
                 if self.zombies[i].body.intersects(&p.body) && !p.field.readiness && !p.field.active
                 {
+                    // A dash shoves whatever it runs through up and out of the
+                    // way, and neither side takes anything for it. What the
+                    // player buys is room, not a kill - and while an enemy is in
+                    // the air it is out of the melee box too, so the trade costs
+                    // tempo as well as energy.
+                    if dashing {
+                        self.zombies[i].ay = -v.hper(DASH_THROW_PCT);
+                        continue;
+                    }
                     let source = self.zombies[i].body;
                     let ended = self.damage_player(pi, 16.0, &source);
                     if ended {
@@ -1169,6 +1453,24 @@ impl Game {
                     if self.zombies[i].behavior == Behavior::Blinker {
                         self.blink_away(i);
                         break;
+                    }
+                }
+            }
+
+            // Husks hurt on contact and cannot be hurt back. They are scenery
+            // with teeth rather than enemies, which is also why they never
+            // count towards clearing a wave.
+            for h in 0..self.zombies[i].husks.len() {
+                let husk = self.zombies[i].husks[h];
+                for pi in 0..self.players.len() {
+                    if self.players[pi].dead {
+                        continue;
+                    }
+                    let p = &self.players[pi];
+                    if husk.intersects(&p.body) && !p.field.readiness && !p.field.active {
+                        if self.damage_player(pi, HUSK_DAMAGE, &husk) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -1243,6 +1545,40 @@ impl Game {
         } else {
             self.camera_x + v.w + v.wper(5.0)
         };
+        self.zombies[i].body.y = v.hper(GROUND_Y_PCT) - self.zombies[i].body.h;
+        self.zombies[i].ax = 0.0;
+        self.zombies[i].ay = 0.0;
+    }
+
+    /// Leaves a husk where a shedder is standing and puts the shedder itself
+    /// back beyond the player's reach.
+    ///
+    /// The distance is measured from the player rather than from the enemy, and
+    /// it is past the melee ceiling, so no amount of ramped reach turns one hit
+    /// into two. The side is a coin flip: fleeing consistently away would let
+    /// the player herd it.
+    fn shed_and_flee(&mut self, i: usize) {
+        let v = self.viewport;
+        let body = self.zombies[i].body;
+
+        if self.zombies[i].max_husks > 0 {
+            // One in, one out for an ordinary shedder. The boss's cap is never
+            // reached, so it keeps every husk it has left.
+            while self.zombies[i].husks.len() >= self.zombies[i].max_husks {
+                self.zombies[i].husks.remove(0);
+            }
+            self.zombies[i].husks.push(body);
+        }
+
+        self.explosions
+            .push(Explosion::new(body.x + body.w, body.y + body.h, &v));
+
+        let from = match self.nearest_player(body.x) {
+            Some(pi) => self.players[pi].body.center_x(),
+            None => body.x,
+        };
+        let side = if self.rng.flip() { 1.0 } else { -1.0 };
+        self.zombies[i].body.x = from + side * v.wper(SHEDDER_TELEPORT_PCT);
         self.zombies[i].body.y = v.hper(GROUND_Y_PCT) - self.zombies[i].body.h;
         self.zombies[i].ax = 0.0;
         self.zombies[i].ay = 0.0;
@@ -1328,6 +1664,9 @@ impl Game {
             Behavior::None => {}
             // Nothing per-tick: a blinker only reacts to being touched or hit.
             Behavior::Blinker => {}
+            // Nor a shedder: between hits it walks like anything else, and the
+            // chase logic below is what does that.
+            Behavior::Shedder => {}
             Behavior::Jumper { cooldown } => {
                 if cooldown > 0 {
                     self.zombies[i].behavior = Behavior::Jumper {
@@ -1472,7 +1811,15 @@ impl Game {
 
             if let Some((attacker, by_field)) = self.find_attacker(&self.flyers[i].body) {
                 let (fx, fy) = (self.flyers[i].body.x, self.flyers[i].body.y);
-                if self.flyers[i].hp < 0.0 || by_field {
+                // The wall takes a share off a boss and kills anything else
+                // outright, exactly as it does on the ground. It used to be an
+                // instant kill here whatever the health, which meant one charge
+                // ended the flying boss while forty walls could not have ended
+                // a ground one.
+                if by_field && self.flyers[i].is_boss {
+                    self.flyers[i].hp -= self.flyers[i].hpmax * FIELD_BOSS_FRACTION;
+                }
+                if self.flyers[i].hp < 0.0 || (by_field && !self.flyers[i].is_boss) {
                     let (gain, text) = if self.flyers[i].is_boss {
                         let reward = 100 * self.wave;
                         (reward, format!("+{}", reward))
@@ -1507,7 +1854,11 @@ impl Game {
                 } else {
                     -v.wper(0.5)
                 };
-                self.flyers[i].hp -= 64.0;
+                // Swing damage, so only a swing pays it - the wall has already
+                // taken its share above.
+                if !by_field {
+                    self.flyers[i].hp -= 64.0;
+                }
                 // A teleporter blinks away the first time it is touched, which
                 // makes the first exchange with one a surprise rather than a
                 // formality. Later hits let it stand and fight. The flying boss
@@ -1539,9 +1890,19 @@ impl Game {
                 if self.players[pi].dead {
                     continue;
                 }
+                let dashing = self.players[pi].dashing();
                 let p = &self.players[pi];
                 if self.flyers[i].body.intersects(&p.body) && !p.field.readiness && !p.field.active
                 {
+                    // A flyer has no height to shove: its y is recomputed from
+                    // its own sine every tick, so anything written there is gone
+                    // by the next one. Half a period of phase moves it to the
+                    // mirrored point of that arc instead - above the centre line
+                    // if it was below, and the other way round.
+                    if dashing {
+                        self.flyers[i].spawn_offset -= FLYER_DASH_PHASE_SHIFT;
+                        continue;
+                    }
                     let source = self.flyers[i].body;
                     let ended = self.damage_player(pi, 16.0, &source);
                     self.players[pi].ay = -v.hper(2.0);

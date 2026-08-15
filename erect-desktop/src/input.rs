@@ -31,6 +31,9 @@ struct PadState {
     attack: bool,
     back: bool,
     pause: bool,
+    /// The shoulder button, kept apart from the face buttons: it is the only
+    /// pad input the game asks for that is not already spoken for.
+    dash: bool,
 }
 
 pub struct InputReader {
@@ -80,6 +83,8 @@ impl InputReader {
                 attack: pad.is_pressed(Button::West),
                 back: pad.is_pressed(Button::East),
                 pause: pad.is_pressed(Button::Start),
+                dash: pad.is_pressed(Button::LeftTrigger)
+                    || pad.is_pressed(Button::RightTrigger),
             };
         }
     }
@@ -107,6 +112,9 @@ impl InputReader {
             back: is_key_pressed(KeyCode::Escape),
         };
         frame.pause = is_key_pressed(KeyCode::Escape);
+        // Nothing a player reaches for, and the core only acts on it from the
+        // title screen.
+        frame.dev_menu = is_key_pressed(KeyCode::Key8);
 
         for slot in 0..MAX_PLAYERS {
             if !self.connected[slot] {
@@ -133,6 +141,7 @@ impl InputReader {
                             jump: is_key_pressed(KeyCode::W),
                             slam: is_key_pressed(KeyCode::S),
                             attack: is_key_pressed(KeyCode::Space),
+                            dash: is_key_pressed(KeyCode::LeftShift),
                         }
                     } else {
                         PlayerIntent {
@@ -141,6 +150,11 @@ impl InputReader {
                             jump: is_key_pressed(KeyCode::Up),
                             slam: is_key_pressed(KeyCode::Down),
                             attack: is_key_pressed(KeyCode::Enter),
+                            // The second keyboard player gets the other Shift,
+                            // which is the only key on that side of the board
+                            // that pairs with the arrows the way LeftShift does
+                            // with WASD.
+                            dash: is_key_pressed(KeyCode::RightShift),
                         }
                     }
                 }
@@ -157,6 +171,7 @@ impl InputReader {
                             // Slam is B or d-pad down, whichever the player reaches for.
                             slam: self.pad_pressed(slot, |s| s.back)
                                 || self.pad_pressed(slot, |s| s.down),
+                            dash: self.pad_pressed(slot, |s| s.dash),
                         }
                     }
                 }

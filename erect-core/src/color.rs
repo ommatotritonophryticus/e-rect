@@ -79,3 +79,4 @@ impl EaseColor {
         self.cur
     }
 }
+
