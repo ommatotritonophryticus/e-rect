@@ -177,6 +177,35 @@ pub const GUN_MAX_REACH_PCT: f32 = 60.0;
 /// was wanted most. A fraction stays meaningful at every wave.
 pub const FIELD_BOSS_FRACTION: f32 = 1.0 / 7.0;
 
+/// What the blast from a combo-finished kill deals to everything it reaches.
+///
+/// Only the attack the game starts on makes one. It is the reward for keeping
+/// a combo alive, and every upgrade trades that combo away for something else -
+/// so this is what the player gives up by taking one.
+pub const COMBO_BLAST_DAMAGE: f32 = 128.0;
+
+/* ---------------- thrown and placed attacks ---------------- */
+
+/// How fast a bullet travels, as a multiple of a walk.
+pub const BULLET_SPEED_MULT: f32 = 4.0;
+
+/// Ticks a bullet keeps working after it stops on something.
+///
+/// Three, because three connecting ticks is exactly what an ordinary swing
+/// lands. A ranged attack that also out-damaged melee would have nothing left
+/// to trade.
+pub const BULLET_HIT_TICKS: i32 = 3;
+
+/// Ticks a placed box stands for.
+///
+/// Long enough to hold ground with, short enough that it cannot be parked in
+/// front of the player as a permanent shield.
+///
+/// Also shorter than the arc an enemy is thrown into: a throw takes about forty
+/// ticks to come back down, so nothing it catches lands in it twice. That is
+/// what lets it throw like a swing without turning into a juggle.
+pub const TRAP_LIFE_TICKS: i32 = 33;
+
 /* ---------------- dash ---------------- */
 
 /// How far one dash carries the player, as a percentage of the view.
@@ -192,6 +221,14 @@ pub const DASH_TICKS: i32 = 10;
 
 /// Ticks before another dash may start, counted from the end of the last.
 pub const DASH_COOLDOWN_TICKS: i32 = 25;
+
+/// Ticks the shove and the immunity that comes with it outlast the dash itself.
+///
+/// The travel stops on a frame, but the player is still standing where the dash
+/// put them - usually inside the crowd it just went through. Without a tail the
+/// last enemy shoved would be free to touch back on the very next tick, and the
+/// dash would read as ending a frame before it looked like it did.
+pub const DASH_GRACE_TICKS: i64 = 3;
 
 /// A dash costs a bar divided by this - a third of the way to the next charge.
 ///

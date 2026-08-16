@@ -18,6 +18,7 @@
 
 extern crate alloc;
 
+pub mod attack;
 pub mod audio;
 pub mod backdrop;
 pub mod color;
@@ -28,6 +29,7 @@ pub mod game;
 pub mod geom;
 pub mod input;
 pub mod menu;
+pub mod offer;
 pub mod settings;
 pub mod waves;
 
@@ -37,11 +39,13 @@ extern crate std;
 #[cfg(test)]
 mod tests;
 
+pub use attack::AttackKind;
 pub use audio::{AudioEvent, AudioQueue, MusicState, Situation};
 pub use backdrop::{visible_blocks, BackdropBlock};
 pub use color::{EaseColor, Rgb};
 pub use dev::DevSetup;
 pub use game::{Game, RunResult, State};
+pub use offer::{Offer, OfferChoice};
 pub use geom::{Body, Viewport};
 pub use input::{InputFrame, MenuIntent, PlayerIntent};
 pub use settings::{SchemeInfo, Settings, VolumeChannel};

@@ -6,6 +6,7 @@
 //! than a flag on the ordinary one: nothing here can be reached by a player who
 //! did not go looking for it.
 
+use crate::attack::{AttackKind, MAX_LEVEL};
 use crate::waves::{WaveKind, WaveRule};
 
 /// Score moves in steps this size. A run worth of score is thousands of points,
@@ -35,6 +36,20 @@ const RULES: [Option<WaveRule>; 6] = [
     Some(WaveRule::Hidden),
 ];
 
+/// Every attack the menu can hand out, with the one the game starts on first.
+/// `AttackKind::ALL` is the upgrade roster and deliberately excludes it.
+const ATTACKS: [AttackKind; 9] = [
+    AttackKind::Basic,
+    AttackKind::Hammer,
+    AttackKind::Piercing,
+    AttackKind::Lunge,
+    AttackKind::SingleHit,
+    AttackKind::Thin,
+    AttackKind::Tall,
+    AttackKind::Bullet,
+    AttackKind::Frozen,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DevSetup {
     pub wave: i64,
@@ -43,6 +58,8 @@ pub struct DevSetup {
     pub kind: Option<WaveKind>,
     pub rule: Option<WaveRule>,
     pub players: usize,
+    pub attack: AttackKind,
+    pub attack_level: u8,
 }
 
 impl Default for DevSetup {
@@ -53,6 +70,8 @@ impl Default for DevSetup {
             kind: None,
             rule: None,
             players: 1,
+            attack: AttackKind::Basic,
+            attack_level: 1,
         }
     }
 }
@@ -74,6 +93,16 @@ impl DevSetup {
     pub fn adjust_players(&mut self, dir: i32, max_players: usize) {
         let max = max_players.max(1) as i32;
         self.players = (self.players as i32 + dir).clamp(1, max) as usize;
+    }
+
+    pub fn cycle_attack(&mut self, dir: i32) {
+        let at = ATTACKS.iter().position(|a| *a == self.attack).unwrap_or(0);
+        self.attack = ATTACKS[step(at, dir, ATTACKS.len())];
+    }
+
+    pub fn adjust_attack_level(&mut self, dir: i32) {
+        let level = (self.attack_level as i32 + dir).clamp(1, MAX_LEVEL as i32);
+        self.attack_level = level as u8;
     }
 
     pub fn cycle_kind(&mut self, dir: i32) {

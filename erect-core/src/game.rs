@@ -10,6 +10,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::attack::AttackKind;
 use crate::audio::{AudioEvent, AudioQueue, MusicState, Situation};
 use crate::backdrop::BackdropBlock;
 use crate::color::{EaseColor, Rgb};
@@ -19,6 +20,7 @@ use crate::entities::*;
 use crate::geom::{Body, Viewport};
 use crate::input::InputFrame;
 use crate::menu::{Menu, MenuAction, MenuRow};
+use crate::offer::{Offer, OFFER_SCORE_STEP};
 use crate::settings::{SchemeInfo, Settings, VolumeChannel};
 use crate::waves::{FlyerKind, GroundKind, WaveAction, WaveManager, WaveRule};
 
@@ -59,6 +61,13 @@ pub struct Game {
     pub flyers: Vec<Flyer>,
     pub explosions: Vec<Explosion>,
     pub projectiles: Vec<Projectile>,
+    /// Squares the players threw. Enemy-facing, unlike `projectiles`.
+    pub bullets: Vec<Bullet>,
+    /// Boxes the players left standing.
+    pub traps: Vec<Trap>,
+    /// The three things standing in the lull waiting to be hit. `None` outside
+    /// an offer, which is most of the time.
+    pub offer: Option<Offer>,
     pub popups: Vec<ScorePopup>,
     /// Sound cues raised this tick; the frontend drains them after `tick`.
     pub audio: AudioQueue,
@@ -110,10 +119,33 @@ pub struct Game {
     /// Previous state, only so the arrival at the title can be spotted once
     /// rather than every tick it stays there.
     last_state: State,
+    /// Hands out swing and blast identities. One counter for the whole game
+    /// rather than one per player: with a counter each, both players' fifth
+    /// swings share a number, and an enemy hit by one would be counted as
+    /// already hit by the other.
+    next_strike: u32,
+    /// Team score at which the next offer comes due.
+    next_offer_score: i64,
+    /// Its own generator, for the same reason the soundtrack has one: which
+    /// three options turn up must not shift which waves and variants follow.
+    offer_rng: Rng,
     /// Its own generator, deliberately. Drawing the soundtrack from the game's
     /// stream would shift every later decision - which waves, which variants,
     /// which specials - so a cosmetic feature would quietly reshuffle the run.
     audio_rng: Rng,
+}
+
+/// What reached an enemy. The damage and the throw both come from this rather
+/// than from a flag, because there are now four things that can land a hit and
+/// they agree on almost none of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HitSource {
+    /// The wall. Its own rules entirely - see the boss fraction.
+    Field,
+    /// A held swing, whatever kind the player is carrying.
+    Swing,
+    Bullet(usize),
+    Trap(usize),
 }
 
 /* ---------------- background ---------------- */
@@ -153,6 +185,9 @@ impl Game {
             flyers: Vec::new(),
             explosions: Vec::new(),
             projectiles: Vec::new(),
+            bullets: Vec::new(),
+            traps: Vec::new(),
+            offer: None,
             popups: Vec::new(),
             audio: AudioQueue::default(),
             aim_dots: Vec::new(),
@@ -168,7 +203,8 @@ impl Game {
             settings_menu: Menu::new(26.0),
             pause_menu: Menu::new(48.0),
             confirm_menu: Menu::new(52.0),
-            dev_menu: Menu::new(26.0),
+            // Nine rows, so a tighter pitch than the rest.
+            dev_menu: Menu::tight(20.0, 7.0),
             dev: DevSetup::default(),
             schemes,
             max_players,
@@ -176,6 +212,9 @@ impl Game {
             backdrop_seed: seed ^ 0xB5AD_4ECE_DA1C_E2A9,
             audio_roll: seed,
             menu_drift: 1.0,
+            next_strike: 1,
+            next_offer_score: OFFER_SCORE_STEP,
+            offer_rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15),
             last_state: State::Title,
             audio_rng: Rng::new(seed ^ 0x243F_6A88_85A3_08D3),
         };
@@ -225,6 +264,16 @@ impl Game {
 
     pub fn total_kills(&self) -> u32 {
         self.players.iter().map(|p| p.kills).sum()
+    }
+
+    /// The next swing or blast identity.
+    ///
+    /// Never zero: an enemy that has never been hit carries zero, so a strike
+    /// numbered zero would read as having already reached everything.
+    fn take_strike(&mut self) -> u32 {
+        let id = self.next_strike;
+        self.next_strike = self.next_strike.wrapping_add(1).max(1);
+        id
     }
 
     /// Draws a new soundtrack. The value means nothing here; a frontend maps it
@@ -286,6 +335,10 @@ impl Game {
         self.flyers.clear();
         self.explosions.clear();
         self.projectiles.clear();
+        self.bullets.clear();
+        self.traps.clear();
+        self.offer = None;
+        self.next_offer_score = OFFER_SCORE_STEP;
         self.popups.clear();
         self.timer = 0;
         self.wave = 1;
@@ -314,6 +367,11 @@ impl Game {
         // number the menu was showing.
         if let Some(p) = self.players.first_mut() {
             p.score = self.dev.score;
+        }
+
+        for p in self.players.iter_mut() {
+            p.attack = self.dev.attack;
+            p.attack_level = self.dev.attack_level;
         }
 
         self.waves.forced_kind = self.dev.kind;
@@ -366,10 +424,13 @@ impl Game {
         }
         self.waves.begin_wave(self.wave, &mut self.rng);
         self.waves.begin_countdown(WAVE_COUNTDOWN_SECONDS);
+        self.maybe_offer();
 
         // The rule for the coming wave is settled by now, so a wave that pins
         // the player in one place can hand back full health first.
-        if self.waves.rule == WaveRule::StaticCamera {
+        // An offer pins the view the same way a held wave does, so the three
+        // options cannot be walked away from and lost off the edge.
+        if self.waves.rule == WaveRule::StaticCamera || self.offer.is_some() {
             for p in self.players.iter_mut() {
                 p.hp = p.hpmax;
             }
@@ -477,7 +538,9 @@ impl Game {
         // A held wave freezes the view where it started. Only the player needs
         // walls for that: ground enemies walk in on their own and flyers are
         // clamped to the view regardless.
-        if self.waves.rule == WaveRule::StaticCamera {
+        // An offer pins the view the same way a held wave does, so the three
+        // options cannot be walked away from and lost off the edge.
+        if self.waves.rule == WaveRule::StaticCamera || self.offer.is_some() {
             for i in 0..self.players.len() {
                 let w = self.players[i].body.w;
                 let x = self.players[i].body.x;
@@ -510,6 +573,79 @@ impl Game {
             n => {
                 let pick = self.rng.range(0, n as i32 - 1).clamp(0, n as i32 - 1) as usize;
                 self.players[pick].color
+            }
+        }
+    }
+
+    /// Stands three options up in the lull, if the team has earned one.
+    ///
+    /// Both players share it and either can take it: the trigger is the team
+    /// total, which is the same number that drives how fast enemies chase, so
+    /// what the run buys and what it faces keep step.
+    fn maybe_offer(&mut self) {
+        if self.total_score() < self.next_offer_score || self.players.is_empty() {
+            return;
+        }
+        self.next_offer_score += OFFER_SCORE_STEP;
+        let v = self.viewport;
+        let ground = v.hper(GROUND_Y_PCT);
+        let camera = self.camera_x;
+        let (kind, level) = (self.players[0].attack, self.players[0].attack_level);
+        let timer = self.timer;
+        self.offer = Some(Offer::roll(
+            &v,
+            camera,
+            ground,
+            kind,
+            level,
+            timer,
+            &mut self.offer_rng,
+        ));
+    }
+
+    /// Hands the choice to everyone and takes the offer down.
+    fn take_offer(&mut self, index: usize) {
+        let Some(offer) = self.offer.as_ref() else {
+            return;
+        };
+        let choice = offer.choices[index];
+        let v = self.viewport;
+        let (x, y) = (choice.body.x, choice.body.y);
+        for p in self.players.iter_mut() {
+            p.attack = choice.kind;
+            p.attack_level = choice.level;
+        }
+        self.explosions.push(Explosion::new(x, y, &v));
+        self.audio.push(AudioEvent::Slam);
+        self.offer = None;
+    }
+
+    /// Checks the standing options against everything that can land a hit.
+    ///
+    /// They are not enemies - they never chase, never touch back, and never
+    /// count towards clearing a wave - but they are hit exactly like one, so a
+    /// bullet or a trap takes them just as a swing does.
+    fn update_offer(&mut self) {
+        // The lull ending takes the choice off the table. Skipping the wave in
+        // is a way of declining, and a deliberate one.
+        if !self.waves.between_waves() {
+            self.offer = None;
+            return;
+        }
+        let Some(offer) = self.offer.as_ref() else {
+            return;
+        };
+        // They stand there inert for a moment first: a wave ends mid-swing, and
+        // the options appear inside that swing.
+        if !offer.armed(self.timer) {
+            return;
+        }
+        let bodies: [Body; crate::offer::OFFER_CHOICES] =
+            core::array::from_fn(|i| offer.choices[i].body);
+        for (i, body) in bodies.iter().enumerate() {
+            if self.find_attacker(body).is_some() {
+                self.take_offer(i);
+                return;
             }
         }
     }
@@ -818,6 +954,16 @@ impl Game {
                     swatch: None,
                 },
                 MenuRow {
+                    label: format!("ATTACK: {}", self.dev.attack.label()),
+                    action: MenuAction::AdjustDevAttack,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("ATK LEVEL: {}", self.dev.attack_level),
+                    action: MenuAction::AdjustDevAttackLevel,
+                    swatch: None,
+                },
+                MenuRow {
                     label: "START".to_string(),
                     action: MenuAction::StartDevRun,
                     swatch: None,
@@ -939,6 +1085,8 @@ impl Game {
             Some(MenuAction::AdjustDevKind) => self.dev.cycle_kind(dir),
             Some(MenuAction::AdjustDevRule) => self.dev.cycle_rule(dir),
             Some(MenuAction::AdjustDevPlayers) => self.dev.adjust_players(dir, self.max_players),
+            Some(MenuAction::AdjustDevAttack) => self.dev.cycle_attack(dir),
+            Some(MenuAction::AdjustDevAttackLevel) => self.dev.adjust_attack_level(dir),
             _ => {}
         }
     }
@@ -963,6 +1111,8 @@ impl Game {
             Some(MenuAction::AdjustDevKind) => self.dev.cycle_kind(1),
             Some(MenuAction::AdjustDevRule) => self.dev.cycle_rule(1),
             Some(MenuAction::AdjustDevPlayers) => self.dev.adjust_players(1, self.max_players),
+            Some(MenuAction::AdjustDevAttack) => self.dev.cycle_attack(1),
+            Some(MenuAction::AdjustDevAttackLevel) => self.dev.adjust_attack_level(1),
             Some(MenuAction::StartDevRun) => self.start_dev_run(),
             Some(MenuAction::Quit) => self.quit_requested = true,
             Some(MenuAction::Resume) => self.toggle_pause(),
@@ -996,7 +1146,13 @@ impl Game {
             if self.players[i].dead {
                 continue;
             }
-            let intent = input.players[i];
+            let mut intent = input.players[i];
+            // While the choice is up there is nothing to jump over and nothing
+            // to wall off. Attack stays: it is how the choice is made.
+            if self.offer.is_some() {
+                intent.jump = false;
+                intent.slam = false;
+            }
 
             // Movement is held state, so it is simply mirrored each tick.
             if intent.left && !intent.right {
@@ -1055,7 +1211,10 @@ impl Game {
                 self.players[i].dash_ticks = DASH_TICKS;
                 self.players[i].dash_dir = if self.players[i].facing_right { 1.0 } else { -1.0 };
             }
-            if intent.attack && !self.players[i].attacking() {
+            // A thrown attack keeps going while the button is down; everything
+            // else takes one swing per press.
+            let repeat = self.players[i].attack == AttackKind::Bullet && intent.attack_held;
+            if (intent.attack || repeat) && !self.players[i].attacking() {
                 let timer = self.timer;
                 let p = &mut self.players[i];
                 if p.combo == 0 || timer - p.combo_timestamp > COMBO_WINDOW_TICKS {
@@ -1066,8 +1225,67 @@ impl Game {
                 } else {
                     p.combo = 0;
                 }
-                p.attack_ticks = ATTACK_TICKS;
+                p.attack_ticks = p.attack.swing_ticks(ATTACK_TICKS);
+                // A fresh number for the swing. Enemies record it, which is how
+                // a kind that may only land once per enemy tells one swing from
+                // the next. Wrapping is fine: it would take eight hundred hours
+                // of swinging, and a collision only costs one skipped hit.
                 self.audio.push(AudioEvent::Hit);
+                self.players[i].strike_id = self.take_strike();
+
+                // A kind that throws or places holds nothing out; it puts
+                // something into the world and that thing does the work. How
+                // many may be out at once is what its level buys. The two
+                // differ on what happens at the cap: a shot already in the air
+                // is not recalled to make room, while a placed box is.
+                let (kind, level) = (self.players[i].attack, self.players[i].attack_level);
+                let damage = kind.damage(level);
+                let reach = self.waves.rule.gun_reach();
+                let wave = self.wave;
+                match kind {
+                    AttackKind::Bullet => {
+                        let out = self.bullets.iter().filter(|b| b.owner == i).count();
+                        if out < kind.max_instances(level) {
+                            let body = self.players[i].body;
+                            let facing = self.players[i].facing_right;
+                            let push = kind.knockback_scale();
+                            let lift = kind.lift_scale();
+                            self.bullets
+                                .push(Bullet::new(i, &body, facing, &v, damage, push, lift));
+                        }
+                    }
+                    AttackKind::Frozen => {
+                        // A press always places. Once this player's own are at
+                        // the cap their level buys, the oldest makes room for
+                        // it. Refusing instead left the button dead in the hand
+                        // while boxes the player had walked away from stood
+                        // somewhere behind them.
+                        let cap = kind.max_instances(level).max(1);
+                        while self.traps.iter().filter(|t| t.owner == i).count() >= cap {
+                            // They are pushed in order, so the first belonging
+                            // to this player is the oldest of theirs.
+                            let Some(oldest) = self.traps.iter().position(|t| t.owner == i) else {
+                                break;
+                            };
+                            self.traps.remove(oldest);
+                        }
+                        let body = self.players[i].projected_swing(
+                            &v,
+                            reach,
+                            wave,
+                            kind.length_scale(level, 1.0),
+                        );
+                        self.traps.push(Trap {
+                            body,
+                            owner: i,
+                            damage,
+                            knockback: kind.knockback_scale(),
+                            lift: kind.lift_scale(),
+                            ticks_left: TRAP_LIFE_TICKS,
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1111,6 +1329,8 @@ impl Game {
         if self.update_flyers() {
             return;
         }
+        self.update_detached();
+        self.update_offer();
         self.update_explosions();
         self.popups.retain(|p| !p.is_expired(self.timer));
         if self.update_projectiles() {
@@ -1205,6 +1425,7 @@ impl Game {
     fn update_player(&mut self, i: usize) -> bool {
         let v = self.viewport;
         let gravity = self.gravity;
+        let timer = self.timer;
 
         if self.players[i].ay < gravity {
             self.players[i].ay += v.hper(0.1);
@@ -1258,6 +1479,10 @@ impl Game {
             self.players[i].dash_ticks -= 1;
             if self.players[i].dash_ticks == 0 {
                 self.players[i].dash_cooldown = DASH_COOLDOWN_TICKS;
+                // The shove and its immunity outlast the travel. `timer` only
+                // advances at the end of the tick, so this deadline covers the
+                // rest of this frame and then exactly DASH_GRACE_TICKS more.
+                self.players[i].dash_grace_until = timer + DASH_GRACE_TICKS;
             }
             self.players[i].dash_dir * v.wper(DASH_DISTANCE_PCT) / DASH_TICKS as f32
         } else {
@@ -1285,16 +1510,32 @@ impl Game {
     }
 
     /// The living player whose melee box or ultimate field is touching `body`.
-    fn find_attacker(&self, body: &Body) -> Option<(usize, bool)> {
+    fn find_attacker(&self, body: &Body) -> Option<(usize, HitSource)> {
         for (i, p) in self.players.iter().enumerate() {
             if p.dead {
                 continue;
             }
             if p.field.active && body.intersects(&p.field.body) {
-                return Some((i, true));
+                return Some((i, HitSource::Field));
             }
-            if p.attacking() && body.intersects(&p.gun) {
-                return Some((i, false));
+            // Both boxes of a two-sided swing count, and they are the same
+            // swing: an enemy caught by one is not caught again by the other.
+            if p.attacking() && !p.attack.detached() && p.strike_boxes().any(|g| body.intersects(g))
+            {
+                return Some((i, HitSource::Swing));
+            }
+        }
+        // Thrown and placed attacks are checked after the held ones: a player
+        // standing in their own trap should still be swinging, not stuck
+        // re-triggering it.
+        for (bi, b) in self.bullets.iter().enumerate() {
+            if !b.dead && body.intersects(&b.body) {
+                return Some((b.owner, HitSource::Bullet(bi)));
+            }
+        }
+        for (ti, t) in self.traps.iter().enumerate() {
+            if t.ticks_left > 0 && body.intersects(&t.body) {
+                return Some((t.owner, HitSource::Trap(ti)));
             }
         }
         None
@@ -1305,6 +1546,7 @@ impl Game {
     fn update_zombies(&mut self) -> bool {
         let v = self.viewport;
         let gravity = self.gravity;
+        let timer = self.timer;
         let team_score = self.total_score();
         let ground = v.hper(GROUND_Y_PCT);
 
@@ -1322,7 +1564,8 @@ impl Game {
             };
             let target_x = self.players[target].body.x;
 
-            if let Some((attacker, by_field)) = self.find_attacker(&self.zombies[i].body) {
+            if let Some((attacker, source)) = self.find_attacker(&self.zombies[i].body) {
+                let by_field = source == HitSource::Field;
                 if by_field {
                     // A boss loses a fixed share of its health, so a wall is
                     // worth the same against a wave-25 boss as a wave-5 one.
@@ -1369,8 +1612,19 @@ impl Game {
                         text,
                         created_at: self.timer,
                     });
-                    // Every death leaves a blast; none of them hurt anyone.
-                    self.explosions.push(Explosion::new(zx + zw, zy + zh, &v));
+                    // Every death leaves a blast. Ordinarily it is scenery -
+                    // but a kill that finished a combo with the plain attack
+                    // leaves one that bites, which is what keeping the rhythm
+                    // is worth and what every upgrade trades away.
+                    let finisher = self.players[attacker].attack == AttackKind::Basic
+                        && self.players[attacker].combo == 2;
+                    let blast = if finisher {
+                        let strike = self.take_strike();
+                        Explosion::lethal(zx + zw, zy + zh, &v, COMBO_BLAST_DAMAGE, strike)
+                    } else {
+                        Explosion::new(zx + zw, zy + zh, &v)
+                    };
+                    self.explosions.push(blast);
                     for _ in 0..self.zombies[i].splits_into {
                         let child = Zombie::child(&self.zombies[i].clone(), &v, &mut self.rng);
                         self.zombies.push(child);
@@ -1378,6 +1632,49 @@ impl Game {
                     self.zombies.remove(i);
                     continue;
                 }
+                let kind = self.players[attacker].attack;
+                let level = self.players[attacker].attack_level;
+                // A kind that only lands once per swing checks the enemy's
+                // memory of which swing last reached it. Indices into the enemy
+                // vectors are not stable - enemies are removed mid-loop - so
+                // the identity lives on the swing, not on a list of victims.
+                let strike = self.players[attacker].strike_id;
+                let already = self.zombies[i].last_strike == strike && strike != 0;
+                // Damage and throw come from whatever actually reached the
+                // enemy. A thrown or placed attack carries the numbers it was
+                // made with, so a later upgrade cannot change a shot already in
+                // the air.
+                let (hit_damage, push, lift) = match source {
+                    HitSource::Field => (0.0, 1.0, 1.0),
+                    HitSource::Swing => (
+                        kind.damage(level),
+                        kind.knockback_scale(),
+                        kind.lift_scale(),
+                    ),
+                    HitSource::Bullet(bi) => (
+                        self.bullets[bi].damage,
+                        self.bullets[bi].knockback,
+                        self.bullets[bi].lift,
+                    ),
+                    HitSource::Trap(ti) => (
+                        self.traps[ti].damage,
+                        self.traps[ti].knockback,
+                        self.traps[ti].lift,
+                    ),
+                };
+                // A repeat contact from a swing that has already landed on this
+                // enemy is not a hit at all: no damage, no throw, no score.
+                // Paying for it would turn a kind that hits once into one that
+                // earns six times over. Note this is not a `continue` - the
+                // enemy still has the rest of its tick coming, gravity included.
+                let repeat = source == HitSource::Swing && kind.once_per_enemy() && already;
+                if !repeat {
+                    // A bullet stops on the first thing it reaches.
+                    if let HitSource::Bullet(bi) = source {
+                        if self.bullets[bi].flying() {
+                            self.bullets[bi].stop();
+                        }
+                    }
                 self.players[attacker].score += 3;
                 self.award_energy(attacker, 3);
                 let (zx, zy) = (self.zombies[i].body.x, self.zombies[i].body.y);
@@ -1389,11 +1686,22 @@ impl Game {
                 });
                 let attacker_x = self.players[attacker].body.x;
                 let dir = if zx > attacker_x { 1.0 } else { -1.0 };
-                self.zombies[i].ay = -v.hper(2.0);
-                // Thrown off at exactly walking pace, whatever it is. It
-                // used to scale with the enemy's own health, which made a boss
-                // travel three times as far from a hit as a runt did.
-                self.zombies[i].ax = dir * v.wper(PLAYER_MOVE_PCT);
+
+                // A heavier swing that threw on every connecting tick would
+                // clear the enemy out sooner and so land less often than a
+                // light one. Those kinds hold the throw until the last tick.
+                // The two halves of a throw are applied apart, because a
+                // bullet wants the lift without the shove: sideways travel
+                // would carry the target out of the square still working on it.
+                if lift > 0.0 {
+                    self.zombies[i].ay = -v.hper(2.0) * lift;
+                }
+                if push > 0.0 {
+                    // Thrown off at exactly walking pace, whatever it is. It
+                    // used to scale with the enemy's own health, which made a
+                    // boss travel three times as far from a hit as a runt did.
+                    self.zombies[i].ax = dir * v.wper(PLAYER_MOVE_PCT) * push;
+                }
                 // Only a swing does swing damage. The wall reaching an enemy
                 // used to add this on top of its own, which was invisible while
                 // the wall dealt a flat 255 - the 64 was what actually took an
@@ -1401,7 +1709,9 @@ impl Game {
                 // a boss lose a seventh plus a hit.
                 if !by_field {
                     let armor = self.zombies[i].armor;
-                    self.zombies[i].hp -= 64.0 * armor;
+                    self.zombies[i].hp -= hit_damage * armor;
+                    self.zombies[i].last_strike = strike;
+                }
                 }
 
                 // Every hit it lives through sends it out of reach, leaving a
@@ -1423,6 +1733,15 @@ impl Game {
                     self.zombies[i].ay = -v.hper(2.0);
                     self.zombies[i].ax =
                         dir * (v.wper(0.5) + v.wper(0.1) * self.zombies[i].hpmax / 255.0);
+                    // A live blast bites once, not on every tick it covers the
+                    // enemy while it grows - hence the identity, drawn from the
+                    // same pool swings use.
+                    let (blast_damage, blast_strike) =
+                        (self.explosions[e].damage, self.explosions[e].strike);
+                    if blast_damage > 0.0 && self.zombies[i].last_strike != blast_strike {
+                        self.zombies[i].last_strike = blast_strike;
+                        self.zombies[i].hp -= blast_damage;
+                    }
                 }
             }
 
@@ -1430,7 +1749,7 @@ impl Game {
                 if self.players[pi].dead {
                     continue;
                 }
-                let dashing = self.players[pi].dashing();
+                let dashing = self.players[pi].in_dash_window(timer);
                 let p = &self.players[pi];
                 if self.zombies[i].body.intersects(&p.body) && !p.field.readiness && !p.field.active
                 {
@@ -1785,6 +2104,7 @@ impl Game {
 
     fn update_flyers(&mut self) -> bool {
         let v = self.viewport;
+        let timer = self.timer;
         let mut i = self.flyers.len();
         while i > 0 {
             i -= 1;
@@ -1809,7 +2129,8 @@ impl Game {
                 return true;
             }
 
-            if let Some((attacker, by_field)) = self.find_attacker(&self.flyers[i].body) {
+            if let Some((attacker, source)) = self.find_attacker(&self.flyers[i].body) {
+                let by_field = source == HitSource::Field;
                 let (fx, fy) = (self.flyers[i].body.x, self.flyers[i].body.y);
                 // The wall takes a share off a boss and kills anything else
                 // outright, exactly as it does on the ground. It used to be an
@@ -1855,9 +2176,32 @@ impl Game {
                     -v.wper(0.5)
                 };
                 // Swing damage, so only a swing pays it - the wall has already
-                // taken its share above.
+                // taken its share above. What a swing is worth depends on what
+                // the player is carrying, and a bullet or a trap carries its
+                // own number.
                 if !by_field {
-                    self.flyers[i].hp -= 64.0;
+                    let attacker_kind = self.players[attacker].attack;
+                    let attacker_level = self.players[attacker].attack_level;
+                    let strike = self.players[attacker].strike_id;
+                    let repeat = source == HitSource::Swing
+                        && attacker_kind.once_per_enemy()
+                        && self.flyers[i].last_strike == strike
+                        && strike != 0;
+                    if !repeat {
+                        let hit_damage = match source {
+                            HitSource::Field => 0.0,
+                            HitSource::Swing => attacker_kind.damage(attacker_level),
+                            HitSource::Bullet(bi) => {
+                                if self.bullets[bi].flying() {
+                                    self.bullets[bi].stop();
+                                }
+                                self.bullets[bi].damage
+                            }
+                            HitSource::Trap(ti) => self.traps[ti].damage,
+                        };
+                        self.flyers[i].hp -= hit_damage;
+                        self.flyers[i].last_strike = strike;
+                    }
                 }
                 // A teleporter blinks away the first time it is touched, which
                 // makes the first exchange with one a surprise rather than a
@@ -1890,7 +2234,7 @@ impl Game {
                 if self.players[pi].dead {
                     continue;
                 }
-                let dashing = self.players[pi].dashing();
+                let dashing = self.players[pi].in_dash_window(timer);
                 let p = &self.players[pi];
                 if self.flyers[i].body.intersects(&p.body) && !p.field.readiness && !p.field.active
                 {
@@ -1933,6 +2277,37 @@ impl Game {
     }
 
     /* ---------------- effects ---------------- */
+
+    /// Moves the thrown squares and ages the placed ones.
+    ///
+    /// Neither deals its damage here: that happens where every other hit does,
+    /// through `find_attacker`, so a bullet kill pays score and leaves a blast
+    /// exactly like a swing kill does.
+    fn update_detached(&mut self) {
+        let (left, right) = (self.view_left(), self.view_right());
+        for b in self.bullets.iter_mut() {
+            if b.flying() {
+                b.body.x += b.ax;
+                // Gone at the edge of what the player can see. The field runs
+                // forever, so without this a miss would travel until the run
+                // ended.
+                if b.body.x + b.body.w < left || b.body.x > right {
+                    b.dead = true;
+                }
+            } else {
+                b.ticks_left -= 1;
+                if b.ticks_left <= 0 {
+                    b.dead = true;
+                }
+            }
+        }
+        self.bullets.retain(|b| !b.dead);
+
+        for t in self.traps.iter_mut() {
+            t.ticks_left -= 1;
+        }
+        self.traps.retain(|t| t.ticks_left > 0);
+    }
 
     fn update_explosions(&mut self) {
         let v = self.viewport;

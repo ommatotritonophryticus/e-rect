@@ -141,6 +141,7 @@ impl InputReader {
                             jump: is_key_pressed(KeyCode::W),
                             slam: is_key_pressed(KeyCode::S),
                             attack: is_key_pressed(KeyCode::Space),
+                            attack_held: is_key_down(KeyCode::Space),
                             dash: is_key_pressed(KeyCode::LeftShift),
                         }
                     } else {
@@ -150,6 +151,7 @@ impl InputReader {
                             jump: is_key_pressed(KeyCode::Up),
                             slam: is_key_pressed(KeyCode::Down),
                             attack: is_key_pressed(KeyCode::Enter),
+                            attack_held: is_key_down(KeyCode::Enter),
                             // The second keyboard player gets the other Shift,
                             // which is the only key on that side of the board
                             // that pairs with the arrows the way LeftShift does
@@ -168,6 +170,7 @@ impl InputReader {
                             right: self.cur[slot].right,
                             jump: self.pad_pressed(slot, |s| s.jump),
                             attack: self.pad_pressed(slot, |s| s.attack),
+                            attack_held: self.cur[slot].attack,
                             // Slam is B or d-pad down, whichever the player reaches for.
                             slam: self.pad_pressed(slot, |s| s.back)
                                 || self.pad_pressed(slot, |s| s.down),

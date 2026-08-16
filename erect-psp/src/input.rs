@@ -91,6 +91,7 @@ impl Input {
             // Slam is Circle or d-pad down, whichever the player reaches for.
             slam: pressed(c.circle, p.circle) || pressed(c.down, p.down),
             attack: pressed(c.square, p.square),
+            attack_held: c.square,
             dash: pressed(c.triangle, p.triangle),
         };
 

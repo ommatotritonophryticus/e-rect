@@ -118,7 +118,7 @@ unsafe fn render_title(game: &Game) {
             );
         }
         centered("E-Rect", 24.0, v.hper(13.0), WHITE, game);
-        render_menu(game, game.title_menu.index, game.title_menu.top_pct);
+        render_menu(game, &game.title_menu);
         centered(
             &format!("RECORD: {}", game.settings.record_solo),
             80.0,
@@ -133,7 +133,7 @@ unsafe fn render_settings(game: &Game) {
     unsafe {
         let v = &game.viewport;
         centered("SETTINGS", 16.0, v.hper(10.0), WHITE, game);
-        render_menu(game, game.settings_menu.index, game.settings_menu.top_pct);
+        render_menu(game, &game.settings_menu);
         centered("LEFT/RIGHT CHANGE   O BACK", 88.0, v.hper(5.0), GREY, game);
     }
 }
@@ -142,19 +142,21 @@ unsafe fn render_dev_menu(game: &Game) {
     unsafe {
         let v = &game.viewport;
         centered("DEV", 14.0, v.hper(9.0), WHITE, game);
-        render_menu(game, game.dev_menu.index, game.dev_menu.top_pct);
+        render_menu(game, &game.dev_menu);
         centered("LEFT/RIGHT CHANGE   O BACK", 92.0, v.hper(4.5), GREY, game);
     }
 }
 
-unsafe fn render_menu(game: &Game, selected: usize, top_pct: f32) {
+unsafe fn render_menu(game: &Game, menu: &erect_core::menu::Menu) {
     unsafe {
         let v = &game.viewport;
         let rows = game.menu_rows([true, false]);
-        let size = readable(v.hper(8.0));
+        // Text follows the row pitch, so a tightened menu shrinks to match
+        // instead of overlapping itself.
+        let size = readable(v.hper(menu.row_h_pct * 0.85));
 
         for (i, row) in rows.iter().enumerate() {
-            let is_selected = i == selected;
+            let is_selected = i == menu.index;
             let label = if !is_selected {
                 row.label.clone()
             } else if row.is_adjustable() {
@@ -163,7 +165,7 @@ unsafe fn render_menu(game: &Game, selected: usize, top_pct: f32) {
                 format!("> {} <", row.label)
             };
             let color = if is_selected { WHITE } else { GREY };
-            let y_pct = top_pct + i as f32 * MENU_ROW_H_PCT;
+            let y_pct = menu.row_y_pct(i);
             let text_w = crate::font::text_width(&label, size);
             let x = (SCREEN_W as f32 - text_w) / 2.0;
             gfx::text_shadowed(x, v.hper(y_pct), size, color, &label);
@@ -214,9 +216,43 @@ unsafe fn render_session(game: &Game) {
         for p in game.players.iter().filter(|p| !p.dead) {
             let body = on_screen(&p.body, cam);
             actor(&body, gfx::pack(p.color.shaded(p.hp / 255.0)), ow, oh);
-            let gun = on_screen(&p.gun, cam);
-            gfx::rect(gun.x, gun.y - oh, gun.w + ow, gun.h + oh * 2.0, BLACK);
-            gfx::rect(gun.x, gun.y, gun.w, gun.h, gfx::pack(p.gun_color()));
+            // Thrown squares and placed boxes, in the player's own colour so
+            // it is obvious in co-op whose they are.
+            let mine = gfx::pack(p.color);
+            for b in game.bullets.iter().filter(|b| b.owner == p.index) {
+                let b = on_screen(&b.body, cam);
+                actor(&b, mine, ow, oh);
+            }
+            for t in game.traps.iter().filter(|t| t.owner == p.index) {
+                let t = on_screen(&t.body, cam);
+                actor(&t, mine, ow, oh);
+            }
+
+            // A two-sided swing puts out a second box behind the player.
+            let color = gfx::pack(p.gun_color());
+            for gun in p.strike_boxes() {
+                let gun = on_screen(gun, cam);
+                gfx::rect(gun.x, gun.y - oh, gun.w + ow, gun.h + oh * 2.0, BLACK);
+                gfx::rect(gun.x, gun.y, gun.w, gun.h, color);
+            }
+        }
+
+        // The three standing options, when the lull is offering any.
+        if let Some(offer) = game.offer.as_ref() {
+            let size = readable(v.hper(4.0));
+            // Dim until a hit on one counts - see the desktop renderer.
+            let face = if offer.armed(game.timer) { WHITE } else { DIM };
+            for choice in offer.choices.iter() {
+                let body = on_screen(&choice.body, cam);
+                actor(&body, face, ow, oh);
+                let label = if choice.is_upgrade(game.players[0].attack) {
+                    format!("{} {}", choice.kind.label(), choice.level)
+                } else {
+                    alloc::string::String::from(choice.kind.label())
+                };
+                let x = body.x + body.w / 2.0 - crate::font::text_width(&label, size) / 2.0;
+                gfx::text_shadowed(x, body.y - v.hper(2.0), size, face, &label);
+            }
         }
 
         // A blind wave hides the enemies themselves; the player, its attacks,
@@ -271,12 +307,12 @@ unsafe fn render_session(game: &Game) {
         match game.state {
             State::Paused => {
                 centered("PAUSE", 30.0, v.hper(11.0), WHITE, game);
-                render_menu(game, game.pause_menu.index, game.pause_menu.top_pct);
+                render_menu(game, &game.pause_menu);
             }
             State::ConfirmAbandon => {
                 centered("LEAVE THE RUN?", 28.0, v.hper(9.0), WHITE, game);
                 centered("THE SCORE STILL COUNTS", 40.0, v.hper(5.0), GREY, game);
-                render_menu(game, game.confirm_menu.index, game.confirm_menu.top_pct);
+                render_menu(game, &game.confirm_menu);
             }
             _ => {}
         }

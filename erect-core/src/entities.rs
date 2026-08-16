@@ -8,6 +8,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::attack::{AttackKind, HeightAnchor};
 use crate::color::Rgb;
 use crate::config::*;
 use crate::geom::{Body, Viewport};
@@ -45,6 +46,12 @@ pub struct Player {
     pub dash_dir: f32,
     /// Ticks until another dash may start. Also drives the indicator.
     pub dash_cooldown: i32,
+    /// Last tick on which the dash still shoves and still cannot be touched.
+    ///
+    /// A deadline rather than a countdown: the dash ends partway through a tick
+    /// that has already done some of its work, and a counter set there would be
+    /// decremented by that same tick and come up one frame short.
+    pub dash_grace_until: i64,
 
     pub grounded: bool,
     pub facing_right: bool,
@@ -54,6 +61,16 @@ pub struct Player {
     pub dead: bool,
 
     pub gun: Body,
+    /// The second box of a two-sided swing, behind the player. `None` for every
+    /// kind that only reaches one way.
+    pub gun_back: Option<Body>,
+    /// Which attack the upgrades have left this player with.
+    pub attack: AttackKind,
+    /// How far that upgrade has been taken, from 1 to the kind's maximum.
+    pub attack_level: u8,
+    /// Counts up once per swing. Enemies remember the last one that hit them,
+    /// which is how a kind that may only land once per swing knows.
+    pub strike_id: u32,
     pub field: UltimateField,
 }
 
@@ -78,6 +95,7 @@ impl Player {
             dash_ticks: 0,
             dash_dir: 1.0,
             dash_cooldown: 0,
+            dash_grace_until: -1,
             grounded: false,
             facing_right: true,
             attack_ticks: 0,
@@ -85,6 +103,10 @@ impl Player {
             combo_timestamp: 0,
             dead: false,
             gun: Body::default(),
+            gun_back: None,
+            attack: AttackKind::Basic,
+            attack_level: 1,
+            strike_id: 0,
             field: UltimateField::default(),
         };
         player.reset(v, v.wper(50.0));
@@ -102,6 +124,7 @@ impl Player {
         self.dash_ticks = 0;
         self.dash_dir = 1.0;
         self.dash_cooldown = 0;
+        self.dash_grace_until = -1;
         self.grounded = false;
         self.facing_right = true;
         self.attack_ticks = 0;
@@ -112,6 +135,9 @@ impl Player {
         self.combo = 0;
         self.combo_timestamp = 0;
         self.dead = false;
+        self.gun_back = None;
+        self.attack = AttackKind::Basic;
+        self.attack_level = 1;
         self.field = UltimateField::default();
     }
 
@@ -128,6 +154,7 @@ impl Player {
         self.attack_ticks = 0;
         self.dash_ticks = 0;
         self.dash_cooldown = 0;
+        self.dash_grace_until = -1;
         self.field = UltimateField::default();
     }
 
@@ -137,6 +164,12 @@ impl Player {
 
     pub fn dashing(&self) -> bool {
         self.dash_ticks > 0
+    }
+
+    /// While this holds, the dash shoves what it touches instead of trading
+    /// damage with it. Outlasts the travel by [`DASH_GRACE_TICKS`].
+    pub fn in_dash_window(&self, timer: i64) -> bool {
+        self.dash_ticks > 0 || timer <= self.dash_grace_until
     }
 
     /// Colour of the melee box.
@@ -180,33 +213,165 @@ impl Player {
     /// up for the mobility the player lost.
     pub fn update_gun(&mut self, v: &Viewport, reach: f32, wave: i64) {
         let b = self.body;
-        self.gun.h = b.h / 2.0;
-        if !self.attacking() {
+        let top = b.y + v.hper(0.5);
+        let base_h = b.h / 2.0;
+
+        // The box at rest is the same for every kind: it is the direction
+        // indicator and the dash readout, not a preview of the swing.
+        //
+        // A kind that throws or places its attack never leaves that state - it
+        // has nothing held out to draw, and the thing it made is in the world.
+        if !self.attacking() || self.attack.detached() {
+            self.gun.h = base_h;
+            self.gun.y = top;
             self.gun.w = b.w / 2.0 * reach;
             self.gun.x = if self.facing_right {
                 b.x + b.w / 2.0 - v.wper(0.5)
             } else {
                 b.x + v.wper(0.5)
             };
-        } else {
-            let ramp = wave.clamp(1, GUN_RAMP_WAVES) as f32 / GUN_RAMP_WAVES as f32;
-            let extra = v.wper(GUN_EXTRA_MAX_PCT) * ramp;
-            self.gun.w = if self.combo == 2 {
-                (b.w + extra) * 2.0 * reach
-            } else {
-                (b.w + extra) * reach
-            };
-            // Reach and the combo each double the box; both at once on a late
-            // wave would otherwise span the field.
-            self.gun.w = self.gun.w.min(v.wper(GUN_MAX_REACH_PCT));
-            self.gun.x = if self.facing_right {
-                b.x + b.w
-            } else {
-                b.x - self.gun.w
-            };
+            self.gun_back = None;
+            return;
         }
-        self.gun.y = b.y + v.hper(0.5);
+
+        let kind = self.attack;
+        let level = self.attack_level;
+
+        // Height first: a kind that trades height for something else anchors
+        // the edge it is not giving up.
+        self.gun.h = base_h * kind.height_scale(level);
+        self.gun.y = match kind.height_anchor() {
+            HeightAnchor::Top => top,
+            HeightAnchor::Bottom => top + base_h - self.gun.h,
+        };
+
+        // How far through the swing we are, 0 on the first tick and 1 on the
+        // last. Only the lunge reads it, but it costs nothing to always have.
+        let total = kind.swing_ticks(ATTACK_TICKS).max(1) as f32;
+        let progress = ((total - self.attack_ticks as f32) / total).clamp(0.0, 1.0);
+
+        let ramp = wave.clamp(1, GUN_RAMP_WAVES) as f32 / GUN_RAMP_WAVES as f32;
+        let extra = v.wper(GUN_EXTRA_MAX_PCT) * ramp;
+        let combo = if self.combo == 2 { 2.0 } else { 1.0 };
+        self.gun.w = (b.w + extra) * combo * reach * kind.length_scale(level, progress);
+        // Reach and the combo each double the box; both at once on a late wave
+        // would otherwise span the field.
+        self.gun.w = self.gun.w.min(v.wper(GUN_MAX_REACH_PCT));
+        self.gun.x = if self.facing_right {
+            b.x + b.w
+        } else {
+            b.x - self.gun.w
+        };
+
+        // The mirrored box of a two-sided swing, sharing every dimension.
+        self.gun_back = kind.two_sided().then(|| {
+            let mut back = self.gun;
+            back.x = if self.facing_right {
+                b.x - self.gun.w
+            } else {
+                b.x + b.w
+            };
+            back
+        });
     }
+
+    /// Every box this player's swing is currently putting into the world.
+    pub fn strike_boxes(&self) -> impl Iterator<Item = &Body> {
+        core::iter::once(&self.gun).chain(self.gun_back.iter())
+    }
+
+    /// Where a held swing of this length would land.
+    ///
+    /// The kinds that place something instead of holding it still aim with the
+    /// same geometry, so the button keeps meaning "put damage over there" - but
+    /// their `update_gun` never leaves the resting box, so there is nothing to
+    /// read off `gun`.
+    pub fn projected_swing(&self, v: &Viewport, reach: f32, wave: i64, length: f32) -> Body {
+        let b = self.body;
+        let ramp = wave.clamp(1, GUN_RAMP_WAVES) as f32 / GUN_RAMP_WAVES as f32;
+        let extra = v.wper(GUN_EXTRA_MAX_PCT) * ramp;
+        let w = ((b.w + extra) * reach * length).min(v.wper(GUN_MAX_REACH_PCT));
+        let x = if self.facing_right { b.x + b.w } else { b.x - w };
+        Body::new(x, b.y + v.hper(0.5), w, b.h / 2.0)
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Thrown and placed attacks
+ * ------------------------------------------------------------------ */
+
+/// A square the player threw instead of swinging.
+///
+/// Kept apart from the shooter's `Projectile` on purpose: that one damages the
+/// player and this one damages enemies, and folding them together would put an
+/// owner check on every collision in the game to save one struct.
+#[derive(Clone, Copy, Debug)]
+pub struct Bullet {
+    pub body: Body,
+    /// Per-tick travel. Zeroed the moment it stops on something.
+    pub ax: f32,
+    pub owner: usize,
+    /// Fixed when it was fired, so a later upgrade cannot change a shot that is
+    /// already in the air.
+    pub damage: f32,
+    /// Multiplies the sideways throw. Zero for a bullet: one that pushed its
+    /// target sideways would shove it straight out of itself.
+    pub knockback: f32,
+    /// Multiplies the upward throw, which a bullet does want.
+    pub lift: f32,
+    /// Counts down only after it has stopped; -1 while still travelling.
+    pub ticks_left: i32,
+    pub dead: bool,
+}
+
+impl Bullet {
+    /// Square in pixels - both `Body` dimensions are pixels, so the shorter
+    /// side of the swing box it replaces gives a real square on any screen.
+    pub fn new(
+        owner: usize,
+        from: &Body,
+        facing_right: bool,
+        v: &Viewport,
+        damage: f32,
+        knockback: f32,
+        lift: f32,
+    ) -> Self {
+        let side = from.h / 2.0;
+        let x = if facing_right { from.x + from.w } else { from.x - side };
+        Self {
+            body: Body::new(x, from.y + v.hper(0.5), side, side),
+            ax: if facing_right { 1.0 } else { -1.0 } * v.wper(PLAYER_MOVE_PCT * BULLET_SPEED_MULT),
+            owner,
+            damage,
+            knockback,
+            lift,
+            ticks_left: -1,
+            dead: false,
+        }
+    }
+
+    pub fn flying(&self) -> bool {
+        self.ticks_left < 0
+    }
+
+    /// Stops it where it is and starts the short life it has left.
+    pub fn stop(&mut self) {
+        self.ax = 0.0;
+        self.ticks_left = BULLET_HIT_TICKS;
+    }
+}
+
+/// A box the player left standing.
+#[derive(Clone, Copy, Debug)]
+pub struct Trap {
+    pub body: Body,
+    pub owner: usize,
+    pub damage: f32,
+    /// Multiplies the sideways and upward throw, carried from the moment it was
+    /// placed for the same reason its damage is.
+    pub knockback: f32,
+    pub lift: f32,
+    pub ticks_left: i32,
 }
 
 /* ------------------------------------------------------------------ *
@@ -302,6 +467,9 @@ pub struct Zombie {
     /// Set by the first hit this one takes; a blinker uses it to leave exactly
     /// once for damage, however many hits follow.
     pub hurt_once: bool,
+    /// The last swing that landed on this one. A kind that may only hit each
+    /// enemy once per swing compares against it; 0 means nothing has.
+    pub last_strike: u32,
     /// Where a shooter's sight points, in world coordinates. Kept across ticks
     /// so the last stretch before the shot can be locked and dodged.
     pub aim: Option<(f32, f32)>,
@@ -345,6 +513,7 @@ impl Zombie {
             enrages: false,
             behavior: Behavior::None,
             hurt_once: false,
+            last_strike: 0,
             aim: None,
             husks: Vec::new(),
             max_husks: 0,
@@ -494,6 +663,8 @@ pub struct Flyer {
     /// Set the first time this flyer is damaged; a teleporter uses it to blink
     /// away exactly once, on that first hit.
     pub hurt_once: bool,
+    /// The last swing that landed on this one; see [`Zombie::last_strike`].
+    pub last_strike: u32,
     pub body: Body,
     pub ax: f32,
     pub ay: f32,
@@ -517,6 +688,7 @@ impl Flyer {
         let x = if rng.flip() { v.w - size_ref.w } else { 0.0 };
         Self {
             hurt_once: false,
+            last_strike: 0,
             is_boss: false,
             body: Body::new(x, 0.0, size_ref.w, size_ref.h / 2.0),
             ax: v.wper(0.5),
@@ -559,6 +731,12 @@ pub struct Explosion {
     pub body: Body,
     pub max_w: f32,
     pub finished: bool,
+    /// What it does to anything it touches. Zero for the blast every death
+    /// leaves, which is scenery; only a combo finisher makes a live one.
+    pub damage: f32,
+    /// Its identity, from the same pool swings draw from, so a growing blast
+    /// hits each enemy once rather than on every tick it covers them.
+    pub strike: u32,
 }
 
 impl Explosion {
@@ -567,7 +745,14 @@ impl Explosion {
             body: Body::new(x, y, 0.0, 0.0),
             max_w: v.wper(20.0),
             finished: false,
+            damage: 0.0,
+            strike: 0,
         }
+    }
+
+    /// A blast that hurts. Only a kill that finished a combo makes one.
+    pub fn lethal(x: f32, y: f32, v: &Viewport, damage: f32, strike: u32) -> Self {
+        Self { damage, strike, ..Self::new(x, y, v) }
     }
 
     pub fn update(&mut self, v: &Viewport) {

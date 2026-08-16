@@ -36,6 +36,8 @@ pub enum MenuAction {
     AdjustDevKind,
     AdjustDevRule,
     AdjustDevPlayers,
+    AdjustDevAttack,
+    AdjustDevAttackLevel,
     /// Begin a run on the parameters set above.
     StartDevRun,
 }
@@ -59,6 +61,8 @@ impl MenuRow {
                 | MenuAction::AdjustDevKind
                 | MenuAction::AdjustDevRule
                 | MenuAction::AdjustDevPlayers
+                | MenuAction::AdjustDevAttack
+                | MenuAction::AdjustDevAttackLevel
         )
     }
 }
@@ -66,15 +70,24 @@ impl MenuRow {
 pub struct Menu {
     pub top_pct: f32,
     pub index: usize,
+    /// Vertical pitch between rows. Its own field rather than the shared
+    /// constant because a long menu has to tighten up to fit: nine rows at the
+    /// usual pitch run off the bottom of a 480x272 screen.
+    pub row_h_pct: f32,
 }
 
 impl Menu {
     pub fn new(top_pct: f32) -> Self {
-        Self { top_pct, index: 0 }
+        Self { top_pct, index: 0, row_h_pct: MENU_ROW_H_PCT }
+    }
+
+    /// A menu with more rows than the usual pitch leaves room for.
+    pub fn tight(top_pct: f32, row_h_pct: f32) -> Self {
+        Self { top_pct, index: 0, row_h_pct }
     }
 
     pub fn row_y_pct(&self, index: usize) -> f32 {
-        self.top_pct + index as f32 * MENU_ROW_H_PCT
+        self.top_pct + index as f32 * self.row_h_pct
     }
 
     pub fn move_by(&mut self, delta: i32, row_count: usize) {

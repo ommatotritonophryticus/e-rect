@@ -4,6 +4,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::attack::{AttackKind, MAX_LEVEL};
+use crate::offer::{OFFER_ARM_TICKS, OFFER_SCORE_STEP};
 use crate::config::*;
 use crate::dev::{DevSetup, DEV_MAX_SCORE, DEV_MAX_WAVE, DEV_SCORE_STEP};
 use crate::entities::*;
@@ -58,7 +60,12 @@ fn swing_at(game: &mut Game, player: usize, target: Body) {
     game.players[player].body.x = target.x - game.players[player].body.w;
     game.players[player].body.y = target.y;
     game.players[player].facing_right = true;
-    game.players[player].attack_ticks = ATTACK_TICKS;
+    let kind = game.players[player].attack;
+    game.players[player].attack_ticks = kind.swing_ticks(ATTACK_TICKS);
+    // The real swing gets its number from the input path; a hand-made one has
+    // to take it too, or a kind that may only land once per swing never knows
+    // which swing it is looking at.
+    game.players[player].strike_id = game.players[player].strike_id.wrapping_add(1).max(1);
     let v = game.viewport;
     game.players[player].update_gun(&v, 1.0, game.wave);
 }
@@ -2744,6 +2751,564 @@ fn plain_enemies_wear_a_player_colour() {
     }
 }
 
+/* ---------------- attack kinds ---------------- */
+
+/// Damage one swing of `kind` puts into a target that cannot die.
+///
+/// Measured rather than read off the constants, because what a swing actually
+/// lands depends on how long the enemy stays inside the box - and that is
+/// decided by the throw, not by the damage number.
+fn swing_damage(kind: AttackKind, level: u8) -> f32 {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].attack = kind;
+    game.players[0].attack_level = level;
+
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
+    z.body.x = game.players[0].body.x + v.wper(6.0);
+    z.hp = 1_000_000.0;
+    z.hpmax = 1_000_000.0;
+    let body = z.body;
+    game.zombies.push(z);
+    game.flyers.clear();
+
+    let before = game.zombies[0].hp;
+    swing_at(&mut game, 0, body);
+    for _ in 0..(kind.swing_ticks(ATTACK_TICKS) + 2) {
+        game.flyers.clear();
+        game.tick(&idle());
+    }
+    before - game.zombies[0].hp
+}
+
+#[test]
+fn an_ordinary_swing_is_the_yardstick() {
+    // Three connecting ticks of sixty-four: the throw clears the enemy out of
+    // the box halfway through the swing. Every kind below is measured against
+    // this, so if it moves, all of those trades move with it.
+    assert_eq!(swing_damage(AttackKind::Basic, 1), 192.0);
+}
+
+#[test]
+fn piercing_trades_safety_for_more_of_the_swing() {
+    // It never throws, so the enemy is not cleared out of the box a third of
+    // the way through - and it stays in touching range for as long as it is in
+    // there. Measured at five connecting ticks against an ordinary swing's
+    // three, not the six the box is out for: with nothing pushing it, the enemy
+    // walks itself through the far edge before the swing ends.
+    let basic = swing_damage(AttackKind::Basic, 1);
+    let pierce = swing_damage(AttackKind::Piercing, 1);
+    assert_eq!(pierce, 64.0 * 5.0, "five connecting ticks");
+    assert!(pierce > basic * 1.5, "well past what an ordinary swing manages");
+    assert!(swing_damage(AttackKind::Piercing, 3) > pierce, "levels should add");
+}
+
+#[test]
+fn the_hammer_lands_once_however_long_it_is_out() {
+    // Twelve ticks of contact must not mean twelve hits: that would be eight
+    // ordinary swings rather than a heavy version of one.
+    let hammer = swing_damage(AttackKind::Hammer, 1);
+    assert_eq!(hammer, 64.0 * 6.0, "one blow, not a stream of them");
+    assert!(
+        hammer < swing_damage(AttackKind::Piercing, 1) * 2.0,
+        "a single blow should not out-damage a kind that gets every tick"
+    );
+}
+
+#[test]
+fn a_single_hit_does_not_depend_on_the_geometry() {
+    // The point of it is a floor under the damage, so the number must not
+    // depend on where the enemy stood or where the throw sent it.
+    let hit = swing_damage(AttackKind::SingleHit, 1);
+    assert_eq!(hit, 64.0 * 4.0);
+    assert!(hit > swing_damage(AttackKind::Basic, 1), "and it beats the average");
+}
+
+#[test]
+fn a_sweep_reaches_behind_as_well_as_in_front() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].attack = AttackKind::Thin;
+    game.players[0].facing_right = true;
+    game.players[0].attack_ticks = ATTACK_TICKS;
+    let v = game.viewport;
+    game.players[0].update_gun(&v, 1.0, game.wave);
+
+    let front = game.players[0].gun;
+    let back = game.players[0].gun_back.expect("a sweep has a second box");
+    assert!(back.x < front.x, "the second box should be on the other side");
+    assert_eq!(back.w, front.w, "and the same size");
+    assert_eq!(back.h, front.h);
+}
+
+#[test]
+fn a_sweep_is_worth_swinging_at_its_first_level() {
+    // It started at a quarter of an ordinary swing per side and played too
+    // short to be worth the height it gives up.
+    let side = |level: u8| {
+        let mut game = new_game();
+        game.start_run(1);
+        settle_on_floor(&mut game);
+        game.players[0].attack = AttackKind::Thin;
+        game.players[0].attack_level = level;
+        game.players[0].attack_ticks = ATTACK_TICKS;
+        let v = game.viewport;
+        game.players[0].update_gun(&v, 1.0, game.wave);
+        game.players[0].gun.w
+    };
+    let basic = {
+        let mut game = new_game();
+        game.start_run(1);
+        settle_on_floor(&mut game);
+        game.players[0].attack_ticks = ATTACK_TICKS;
+        let v = game.viewport;
+        game.players[0].update_gun(&v, 1.0, game.wave);
+        game.players[0].gun.w
+    };
+
+    let sweep = side(1);
+    assert!(
+        (sweep - basic * 0.8).abs() < 0.01,
+        "a first-level sweep reaches {sweep} against an ordinary {basic}"
+    );
+    // Both sides together well past one ordinary swing: that is the trade for
+    // giving up the height.
+    assert!(sweep * 2.0 > basic * 1.5, "two sides should add up to more than one");
+    assert!(side(3) > sweep, "levels still lengthen it");
+}
+
+#[test]
+fn a_sweep_sits_low_and_a_heavy_swing_reaches_down() {
+    // The sweep gives up height and keeps its bottom edge, so it still catches
+    // what stands on the ground while flyers pass over. The tall kind keeps the
+    // top edge and grows down into that same low ground.
+    let swing_box = |kind: AttackKind| {
+        let mut game = new_game();
+        game.start_run(1);
+        settle_on_floor(&mut game);
+        game.players[0].attack = kind;
+        game.players[0].attack_ticks = ATTACK_TICKS;
+        let v = game.viewport;
+        game.players[0].update_gun(&v, 1.0, game.wave);
+        game.players[0].gun
+    };
+
+    let basic = swing_box(AttackKind::Basic);
+    let thin = swing_box(AttackKind::Thin);
+    let tall = swing_box(AttackKind::Tall);
+
+    assert!(thin.h < basic.h, "a sweep is shallower");
+    assert!(
+        (thin.y + thin.h - (basic.y + basic.h)).abs() < 0.01,
+        "and it keeps the bottom edge, not the top"
+    );
+    assert!(tall.h > basic.h, "a heavy swing is deeper");
+    assert!((tall.y - basic.y).abs() < 0.01, "and it keeps the top edge");
+    assert!(tall.w < basic.w, "paid for with reach");
+}
+
+#[test]
+fn a_lunge_starts_short_and_ends_long() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].attack = AttackKind::Lunge;
+    let v = game.viewport;
+
+    game.players[0].attack_ticks = ATTACK_TICKS;
+    game.players[0].update_gun(&v, 1.0, game.wave);
+    let first = game.players[0].gun.w;
+
+    game.players[0].attack_ticks = 1;
+    game.players[0].update_gun(&v, 1.0, game.wave);
+    let last = game.players[0].gun.w;
+
+    assert!(last > first * 2.0, "a lunge should be reaching by the end");
+}
+
+#[test]
+fn the_resting_box_is_the_same_whatever_the_upgrade() {
+    // It is the direction indicator and the dash readout, not a preview of the
+    // swing, so no upgrade may move it.
+    let resting = |kind: AttackKind| {
+        let mut game = new_game();
+        game.start_run(1);
+        settle_on_floor(&mut game);
+        game.players[0].attack = kind;
+        game.players[0].attack_ticks = 0;
+        let v = game.viewport;
+        game.players[0].update_gun(&v, 1.0, game.wave);
+        (game.players[0].gun, game.players[0].gun_back)
+    };
+
+    let (basic, basic_back) = resting(AttackKind::Basic);
+    assert!(basic_back.is_none());
+    for kind in AttackKind::ALL {
+        let (b, back) = resting(kind);
+        assert_eq!(b.w, basic.w, "{kind:?} moved the resting box");
+        assert_eq!(b.h, basic.h, "{kind:?} moved the resting box");
+        assert_eq!(b.y, basic.y, "{kind:?} moved the resting box");
+        assert!(back.is_none(), "{kind:?} left a second box at rest");
+    }
+}
+
+/* ---------------- thrown and placed attacks ---------------- */
+
+/// A run with one player standing still on the floor, carrying `kind`.
+fn armed_with(kind: AttackKind, level: u8) -> Game {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    clear_arena(&mut game);
+    game.players[0].attack = kind;
+    game.players[0].attack_level = level;
+    game.players[0].facing_right = true;
+    game
+}
+
+fn attack_input() -> InputFrame {
+    let mut input = idle();
+    input.players[0].attack = true;
+    input
+}
+
+#[test]
+fn a_shot_is_square_and_leaves_the_player() {
+    let mut game = armed_with(AttackKind::Bullet, 1);
+    let from = game.players[0].body.x;
+    game.tick(&attack_input());
+
+    assert_eq!(game.bullets.len(), 1, "the press should have thrown one");
+    let b = game.bullets[0];
+    assert!((b.body.w - b.body.h).abs() < 0.01, "a bullet is a square in pixels");
+    assert!(b.body.x > from, "and it starts on the side the player faces");
+
+    let start = game.bullets[0].body.x;
+    clear_arena(&mut game);
+    game.tick(&idle());
+    let step = game.bullets[0].body.x - start;
+    let walk = game.viewport.wper(PLAYER_MOVE_PCT);
+    assert!(
+        (step - walk * BULLET_SPEED_MULT).abs() < 0.01,
+        "it should travel at four walks a tick, moved {step}"
+    );
+}
+
+#[test]
+fn a_shot_that_hits_nothing_stops_at_the_edge_of_the_view() {
+    // The field runs forever; without this a miss would fly until the run did.
+    let mut game = armed_with(AttackKind::Bullet, 1);
+    game.tick(&attack_input());
+    assert_eq!(game.bullets.len(), 1);
+
+    for _ in 0..200 {
+        clear_arena(&mut game);
+        game.tick(&idle());
+        if game.bullets.is_empty() {
+            return;
+        }
+    }
+    panic!("the bullet never expired");
+}
+
+#[test]
+fn a_shot_stops_on_what_it_reaches_and_lands_one_tick() {
+    let mut game = armed_with(AttackKind::Bullet, 1);
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
+    z.body.x = game.players[0].body.x + v.wper(25.0);
+    z.hp = 1_000_000.0;
+    z.hpmax = 1_000_000.0;
+    let before = z.hp;
+    game.zombies.push(z);
+
+    game.tick(&attack_input());
+    for _ in 0..30 {
+        game.flyers.clear();
+        game.tick(&idle());
+        if game.bullets.is_empty() {
+            break;
+        }
+    }
+
+    // One connecting tick, not the three the shot stays out for: the throw
+    // carries the target clear immediately, exactly as it does with a swing.
+    // The remaining ticks are not wasted - the stopped shot still catches
+    // whatever walks into it - but they are not spent on the first target.
+    let dealt = before - game.zombies[0].hp;
+    assert_eq!(dealt, 64.0, "one connecting tick");
+    assert!(
+        dealt < 64.0 * BULLET_HIT_TICKS as f32,
+        "the throw should be cutting the shot short"
+    );
+}
+
+#[test]
+fn a_shot_throws_its_target_the_way_a_swing_does() {
+    let mut game = armed_with(AttackKind::Bullet, 1);
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
+    z.body.x = game.players[0].body.x + v.wper(25.0);
+    z.hp = 1_000_000.0;
+    z.hpmax = 1_000_000.0;
+    game.zombies.push(z);
+
+    game.tick(&attack_input());
+    let mut thrown = (false, false);
+    for _ in 0..30 {
+        game.flyers.clear();
+        game.tick(&idle());
+        if game.zombies[0].ay < 0.0 {
+            thrown.0 = true;
+        }
+        if game.zombies[0].ax > 0.0 {
+            thrown.1 = true;
+        }
+        if thrown.0 && thrown.1 {
+            break;
+        }
+    }
+    assert!(thrown.0, "a shot should throw its target upward");
+    assert!(thrown.1, "and away from the shooter");
+}
+
+#[test]
+fn the_level_caps_how_many_shots_are_out_at_once() {
+    for level in 1..=3u8 {
+        let mut game = armed_with(AttackKind::Bullet, level);
+        // Press on every tick the cooldown allows; the cap is what stops it.
+        for _ in 0..40 {
+            clear_arena(&mut game);
+            game.tick(&attack_input());
+            assert!(
+                game.bullets.len() <= level as usize,
+                "level {level} let {} out at once",
+                game.bullets.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_held_button_keeps_shooting() {
+    // The thrown attack is the only kind that repeats: every other one wants
+    // exactly one swing per press, or a combo could never be broken out of.
+    let mut game = armed_with(AttackKind::Bullet, 3);
+    let mut held = idle();
+    held.players[0].attack_held = true;
+
+    let mut fired = 0;
+    for _ in 0..90 {
+        let before = game.bullets.len();
+        game.zombies.clear();
+        game.flyers.clear();
+        game.tick(&held);
+        if game.bullets.len() > before {
+            fired += 1;
+        }
+    }
+    assert!(fired > 1, "holding the button only produced {fired} shot(s)");
+}
+
+#[test]
+fn a_held_button_does_not_keep_swinging() {
+    let mut game = armed_with(AttackKind::Basic, 1);
+    let mut held = idle();
+    held.players[0].attack_held = true;
+
+    let mut swings = 0;
+    let mut was_swinging = false;
+    for _ in 0..90 {
+        game.zombies.clear();
+        game.flyers.clear();
+        game.tick(&held);
+        let now = game.players[0].attacking();
+        if now && !was_swinging {
+            swings += 1;
+        }
+        was_swinging = now;
+    }
+    assert_eq!(swings, 0, "a held button swung {swings} times on its own");
+}
+
+#[test]
+fn traps_are_placed_as_fast_as_the_button_is_pressed() {
+    // No wait between placements: how many may stand at once is the only limit.
+    let mut game = armed_with(AttackKind::Frozen, 3);
+    for _ in 0..3 {
+        clear_arena(&mut game);
+        game.tick(&attack_input());
+    }
+    assert_eq!(game.traps.len(), 3, "three presses on three ticks place three");
+}
+
+#[test]
+fn a_new_trap_replaces_the_only_one_at_the_first_level() {
+    let mut game = armed_with(AttackKind::Frozen, 1);
+    game.tick(&attack_input());
+    let first = game.traps[0].body.x;
+
+    // Walk a little so the second lands somewhere else.
+    let v = game.viewport;
+    game.players[0].body.x += v.wper(20.0);
+    clear_arena(&mut game);
+    game.tick(&attack_input());
+
+    assert_eq!(game.traps.len(), 1, "level one holds exactly one");
+    assert!(
+        (game.traps[0].body.x - first).abs() > v.wper(10.0),
+        "the standing one should be the new one"
+    );
+}
+
+#[test]
+fn a_full_set_of_traps_loses_its_oldest_to_the_next_one() {
+    let mut game = armed_with(AttackKind::Frozen, 3);
+    let v = game.viewport;
+
+    let mut placed = Vec::new();
+    for _ in 0..3 {
+        clear_arena(&mut game);
+        game.tick(&attack_input());
+        placed.push(game.traps.last().unwrap().body.x);
+        game.players[0].body.x += v.wper(15.0);
+    }
+    assert_eq!(game.traps.len(), 3);
+
+    // The fourth press still places, and the first one is what makes room.
+    clear_arena(&mut game);
+    game.tick(&attack_input());
+    assert_eq!(game.traps.len(), 3, "the cap still holds");
+    assert!(
+        !game.traps.iter().any(|t| (t.body.x - placed[0]).abs() < 0.01),
+        "the oldest should have made way"
+    );
+    assert!(
+        game.traps.iter().any(|t| (t.body.x - placed[1]).abs() < 0.01),
+        "the second oldest should still be standing"
+    );
+}
+
+#[test]
+fn a_shot_already_in_the_air_is_not_recalled_to_make_room() {
+    // The two detached kinds differ here on purpose: a placed box is the
+    // player's to move, a bullet has left.
+    let mut game = armed_with(AttackKind::Bullet, 1);
+    game.tick(&attack_input());
+    assert_eq!(game.bullets.len(), 1);
+    let first = game.bullets[0].body.x;
+
+    clear_arena(&mut game);
+    game.tick(&attack_input());
+    assert_eq!(game.bullets.len(), 1, "the cap still holds");
+    assert!(
+        (game.bullets[0].body.x - first).abs() > 0.0,
+        "and the one flying is still the first"
+    );
+}
+
+#[test]
+fn a_trap_stands_where_the_swing_would_have_reached() {
+    let mut game = armed_with(AttackKind::Frozen, 1);
+    let player_right = game.players[0].body.x + game.players[0].body.w;
+    game.tick(&attack_input());
+
+    assert_eq!(game.traps.len(), 1);
+    let t = game.traps[0];
+    assert!(t.body.x >= player_right - 0.01, "placed in front, not on the player");
+    assert!(t.ticks_left > 0);
+}
+
+#[test]
+fn a_trap_expires_so_it_cannot_be_parked_as_a_shield() {
+    let mut game = armed_with(AttackKind::Frozen, 1);
+    game.tick(&attack_input());
+    assert_eq!(game.traps.len(), 1);
+
+    for _ in 0..TRAP_LIFE_TICKS + 2 {
+        clear_arena(&mut game);
+        // Deliberately idle: a trap must go on its own, not only when replaced.
+        game.tick(&idle());
+    }
+    assert!(game.traps.is_empty(), "the trap outlived its welcome");
+}
+
+#[test]
+fn a_trap_throws_what_it_catches() {
+    // It holds ground the same way a swing does, and its life is shorter than
+    // the arc it throws into - so nothing it catches comes back down inside it
+    // and gets juggled.
+    let mut game = armed_with(AttackKind::Frozen, 1);
+    game.tick(&attack_input());
+    let trap = game.traps[0].body;
+
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body = trap;
+    z.hp = 1_000_000.0;
+    z.hpmax = 1_000_000.0;
+    game.zombies.push(z);
+    game.flyers.clear();
+    game.tick(&idle());
+
+    assert!(game.zombies[0].ay < 0.0, "a trap should throw like a swing");
+    assert!(
+        (TRAP_LIFE_TICKS as f32) < 40.0,
+        "a trap that outlasts the throw arc would juggle what it catches"
+    );
+}
+
+#[test]
+fn a_trap_grinds_rather_than_deleting_what_walks_in() {
+    // It never throws, so anything standing in it takes every tick. That is
+    // why its per-tick damage is a quarter of a swing's: at full value a single
+    // trap would be a kill zone rather than ground held.
+    let mut game = armed_with(AttackKind::Frozen, 1);
+    game.tick(&attack_input());
+    let trap = game.traps[0].body;
+
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body = trap;
+    z.hp = 1_000_000.0;
+    z.hpmax = 1_000_000.0;
+    let before = z.hp;
+    game.zombies.push(z);
+
+    game.flyers.clear();
+    game.tick(&idle());
+    let one_tick = before - game.zombies[0].hp;
+    assert_eq!(one_tick, 16.0, "a quarter of a swing's tick");
+}
+
+#[test]
+fn a_detached_kind_never_holds_a_swing_out() {
+    // The box on the player stays the resting one: there is nothing held, and
+    // the thing that does the work is in the world.
+    for kind in [AttackKind::Bullet, AttackKind::Frozen] {
+        let mut game = armed_with(kind, 1);
+        let v = game.viewport;
+        game.players[0].update_gun(&v, 1.0, game.wave);
+        let resting = game.players[0].gun;
+
+        game.tick(&attack_input());
+        assert_eq!(
+            game.players[0].gun.w, resting.w,
+            "{kind:?} held a swing out anyway"
+        );
+        assert!(
+            game.players[0].gun_back.is_none(),
+            "{kind:?} put out a second box"
+        );
+    }
+}
+
 /* ---------------- dash ---------------- */
 
 fn dash_input() -> InputFrame {
@@ -2903,6 +3468,45 @@ fn a_dash_throws_enemies_clear_and_hurts_nobody() {
     assert!(z.ay < 0.0, "the enemy should have been thrown upward");
     assert_eq!(z.hp, hp_before, "a dash must not damage what it shoves");
     assert_eq!(game.players[0].hp, player_hp, "and must not cost the player health");
+}
+
+#[test]
+fn the_shove_outlasts_the_dash_by_three_frames() {
+    // The travel stops on a frame, but the player is left standing inside the
+    // crowd it went through. Without the tail the last enemy shoved would be
+    // free to touch back on the very next tick.
+    let mut game = new_game();
+    ready_to_dash(&mut game);
+    clear_arena(&mut game);
+
+    game.tick(&dash_input());
+    while game.players[0].dashing() {
+        clear_arena(&mut game);
+        game.tick(&idle());
+    }
+
+    // Park an enemy on top of the player each tick and see whether it gets
+    // shoved or whether it bites.
+    let mut safe_frames = 0;
+    for _ in 0..(DASH_GRACE_TICKS + 3) {
+        clear_arena(&mut game);
+        let v = game.viewport;
+        let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+        z.body = game.players[0].body;
+        game.zombies.push(z);
+        let hp_before = game.players[0].hp;
+
+        game.tick(&idle());
+
+        if game.players[0].hp < hp_before {
+            break;
+        }
+        safe_frames += 1;
+    }
+    assert_eq!(
+        safe_frames, DASH_GRACE_TICKS,
+        "the window should outlast the travel by exactly {DASH_GRACE_TICKS} frames"
+    );
 }
 
 #[test]
@@ -3108,6 +3712,86 @@ fn an_ordinary_run_never_inherits_the_pins() {
     game.start_run(1);
     assert_eq!(game.waves.forced_kind, None, "a normal run kept a pinned kind");
     assert_eq!(game.waves.forced_rule, None, "a normal run kept a pinned rule");
+}
+
+#[test]
+fn the_dev_menu_hands_out_an_attack_and_its_level() {
+    let mut game = new_game();
+    game.dev.attack = AttackKind::Frozen;
+    game.dev.attack_level = 3;
+    game.dev.players = 1;
+    game.start_dev_run();
+
+    assert_eq!(game.players[0].attack, AttackKind::Frozen);
+    assert_eq!(game.players[0].attack_level, 3);
+    // And the level is what the cap actually reads. Counted as a high-water
+    // mark rather than a snapshot: traps expire, so what is standing at any
+    // one moment depends on when you look.
+    let mut most = 0;
+    for _ in 0..40 {
+        clear_arena(&mut game);
+        game.tick(&attack_input());
+        most = most.max(game.traps.len());
+        assert!(game.traps.len() <= 3, "level three let a fourth out");
+    }
+    assert_eq!(most, 3, "three traps at level three");
+}
+
+#[test]
+fn an_ordinary_run_starts_on_the_basic_attack() {
+    // The dev menu must not leak a weapon into a run started the normal way.
+    let mut game = new_game();
+    game.dev.attack = AttackKind::Hammer;
+    game.dev.attack_level = 3;
+    game.start_dev_run();
+    assert_eq!(game.players[0].attack, AttackKind::Hammer);
+
+    game.start_run(1);
+    assert_eq!(game.players[0].attack, AttackKind::Basic);
+    assert_eq!(game.players[0].attack_level, 1);
+}
+
+#[test]
+fn the_attack_row_cycles_through_every_kind_and_back() {
+    let mut dev = DevSetup::default();
+    assert_eq!(dev.attack, AttackKind::Basic, "it starts where the game does");
+
+    // The list is the upgrade roster plus the attack the game starts on, so a
+    // full turn is one step longer than ALL.
+    let mut seen = Vec::new();
+    for _ in 0..=AttackKind::ALL.len() {
+        seen.push(dev.attack);
+        dev.cycle_attack(1);
+    }
+    for kind in AttackKind::ALL {
+        assert!(seen.contains(&kind), "{kind:?} is never offered");
+    }
+    assert!(seen.contains(&AttackKind::Basic), "nor is the plain one");
+    assert_eq!(dev.attack, AttackKind::Basic, "a full cycle comes home");
+
+    dev.adjust_attack_level(-5);
+    assert_eq!(dev.attack_level, 1, "level should not go below one");
+    dev.adjust_attack_level(99);
+    assert_eq!(dev.attack_level, MAX_LEVEL);
+}
+
+#[test]
+fn the_dev_menu_fits_on_a_psp_screen() {
+    // Nine rows at the usual pitch run off the bottom of a 480x272 panel, under
+    // the floor band. The menu carries its own pitch for exactly this reason.
+    let game = single_player_platform();
+    let rows = game.menu_rows([true, false]).len();
+    let last = game.dev_menu.row_y_pct(rows - 1);
+    assert!(
+        game.state == State::Title || last < GROUND_Y_PCT,
+        "the last row would land at {last}%, under the floor"
+    );
+
+    let mut game = single_player_platform();
+    game.state = State::DevMenu;
+    let rows = game.menu_rows([true, false]).len();
+    let last = game.dev_menu.row_y_pct(rows - 1);
+    assert!(last < GROUND_Y_PCT, "the last of {rows} rows lands at {last}%");
 }
 
 #[test]
@@ -3487,4 +4171,294 @@ fn the_background_says_whether_a_wave_is_running() {
     }
     let fighting = game.background.to_rgb();
     assert!(fighting.r > fighting.g, "a running wave should be the red one");
+}
+
+/* ---------------- the offer between waves ---------------- */
+
+/// Ticks until the standing options accept a hit.
+fn wait_for_armed(game: &mut Game) {
+    for _ in 0..OFFER_ARM_TICKS + 4 {
+        if game.offer.as_ref().is_some_and(|o| o.armed(game.timer)) {
+            return;
+        }
+        game.zombies.clear();
+        game.flyers.clear();
+        game.tick(&idle());
+    }
+    panic!("the offer never went live");
+}
+
+/// Runs a wave out so the lull - and any offer with it - begins.
+fn into_the_lull(game: &mut Game) {
+    for _ in 0..8000 {
+        game.zombies.clear();
+        game.flyers.clear();
+        game.tick(&idle());
+        if game.waves.between_waves() {
+            return;
+        }
+    }
+    panic!("the wave never cleared");
+}
+
+#[test]
+fn an_offer_arrives_once_the_team_has_earned_it() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    assert!(game.offer.is_none(), "nothing is owed at the start");
+
+    game.players[0].score = OFFER_SCORE_STEP;
+    into_the_lull(&mut game);
+    let offer = game.offer.as_ref().expect("the lull should be offering");
+    assert_eq!(offer.choices.len(), 3);
+}
+
+#[test]
+fn the_three_options_are_all_different() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].score = OFFER_SCORE_STEP;
+    into_the_lull(&mut game);
+
+    let c = &game.offer.as_ref().unwrap().choices;
+    assert!(c[0].kind != c[1].kind && c[1].kind != c[2].kind && c[0].kind != c[2].kind);
+    for choice in c.iter() {
+        assert_ne!(choice.kind, AttackKind::Basic, "the plain attack is not an upgrade");
+    }
+}
+
+#[test]
+fn an_offer_ignores_the_swing_that_ended_the_wave() {
+    // The wave ends while the player is still swinging at the last of it, and
+    // the options appear inside that swing. Found in play: every option was
+    // being taken by accident.
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].score = OFFER_SCORE_STEP;
+    into_the_lull(&mut game);
+
+    let offer = game.offer.as_ref().expect("the lull should be offering");
+    assert!(!offer.armed(game.timer), "it must not be live the moment it lands");
+    let target = offer.choices[0].body;
+
+    // Swinging at one for the whole delay changes nothing.
+    let mut swings = 0;
+    while !game.offer.as_ref().is_some_and(|o| o.armed(game.timer)) {
+        game.zombies.clear();
+        game.flyers.clear();
+        swing_at(&mut game, 0, target);
+        game.tick(&idle());
+        swings += 1;
+        assert!(
+            game.offer.is_some(),
+            "an option was taken after {swings} swings, before the offer went live"
+        );
+    }
+    assert!(swings > 60, "the pause was only {swings} ticks - too short to help");
+    assert_eq!(game.players[0].attack, AttackKind::Basic, "nothing was taken");
+
+    // And once it is live, the same swing takes it.
+    assert!(game.offer.as_ref().unwrap().armed(game.timer));
+    swing_at(&mut game, 0, target);
+    game.tick(&idle());
+    assert!(game.offer.is_none(), "it should be takeable now");
+}
+
+#[test]
+fn hitting_an_option_arms_every_player() {
+    // One offer, shared: either player may take it and both end up carrying it.
+    let mut game = new_game();
+    game.start_run(2);
+    settle_on_floor(&mut game);
+    game.players[0].score = OFFER_SCORE_STEP;
+    into_the_lull(&mut game);
+
+    let taken = game.offer.as_ref().unwrap().choices[1];
+    wait_for_armed(&mut game);
+    swing_at(&mut game, 0, taken.body);
+    game.tick(&idle());
+
+    assert!(game.offer.is_none(), "taking one clears the rest");
+    for p in game.players.iter() {
+        assert_eq!(p.attack, taken.kind, "both players should be carrying it");
+        assert_eq!(p.attack_level, taken.level);
+    }
+}
+
+#[test]
+fn an_offer_can_be_declined_by_starting_the_wave() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].score = OFFER_SCORE_STEP;
+    into_the_lull(&mut game);
+    assert!(game.offer.is_some());
+
+    game.waves.skip_countdown();
+    game.tick(&idle());
+    assert!(game.offer.is_none(), "the lull ending takes it off the table");
+    assert_eq!(game.players[0].attack, AttackKind::Basic, "and nothing was taken");
+}
+
+#[test]
+fn the_view_is_pinned_while_the_choice_is_up() {
+    // The options stand in the view; walking off would lose them.
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].score = OFFER_SCORE_STEP;
+    into_the_lull(&mut game);
+
+    let camera = game.camera_x;
+    let mut walk = idle();
+    walk.players[0].right = true;
+    for _ in 0..120 {
+        game.zombies.clear();
+        game.flyers.clear();
+        game.tick(&walk);
+    }
+    assert_eq!(game.camera_x, camera, "the view should not have moved");
+}
+
+#[test]
+fn a_second_offer_costs_another_full_step() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    game.players[0].score = OFFER_SCORE_STEP;
+    into_the_lull(&mut game);
+
+    let first = game.offer.as_ref().unwrap().choices[0];
+    wait_for_armed(&mut game);
+    swing_at(&mut game, 0, first.body);
+    game.tick(&idle());
+    assert!(game.offer.is_none());
+
+    // Same score, next lull: nothing more is owed.
+    game.waves.skip_countdown();
+    into_the_lull(&mut game);
+    assert!(game.offer.is_none(), "one score should not buy two");
+
+    game.players[0].score = OFFER_SCORE_STEP * 2;
+    game.waves.skip_countdown();
+    into_the_lull(&mut game);
+    assert!(game.offer.is_some(), "another step should buy another");
+}
+
+#[test]
+fn the_options_are_rolled_from_their_own_generator() {
+    // Which three turn up must not shift which waves and variants follow, the
+    // same reason the soundtrack has a generator of its own.
+    let wave_stream = |offered: bool| {
+        let mut game = new_game();
+        game.start_run(1);
+        settle_on_floor(&mut game);
+        if offered {
+            game.players[0].score = OFFER_SCORE_STEP;
+        }
+        into_the_lull(&mut game);
+        (game.waves.kind, game.waves.rule)
+    };
+    assert_eq!(
+        wave_stream(false),
+        wave_stream(true),
+        "rolling an offer changed the wave that followed"
+    );
+}
+
+/* ---------------- the combo finisher ---------------- */
+
+/// Kills one enemy with a swing and reports the blasts left behind.
+///
+/// The bystander test below does not go through a swing at all: a full combo
+/// doubles the attack box to 13% of the view while the blast only reaches 10%
+/// out from where it started, so there is no spot that is inside one and
+/// outside the other. The two have to be checked apart.
+fn blast_damage_after_kill(combo: u32) -> f32 {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    clear_arena(&mut game);
+
+    let v = game.viewport;
+    let mut victim = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    victim.body.y = v.hper(GROUND_Y_PCT) - victim.body.h;
+    victim.body.x = game.players[0].body.x + v.wper(6.0);
+    victim.hp = 1.0;
+    let victim_body = victim.body;
+    game.zombies.push(victim);
+    game.flyers.clear();
+
+    game.players[0].combo = combo;
+    swing_at(&mut game, 0, victim_body);
+    // The death check runs before the damage does, so the kill - and the blast
+    // with it - lands on the tick after the one that took the last of its
+    // health.
+    for _ in 0..3 {
+        game.flyers.clear();
+        game.tick(&idle());
+    }
+
+    game.explosions
+        .iter()
+        .map(|e| e.damage)
+        .fold(0.0f32, f32::max)
+}
+
+#[test]
+fn a_combo_kill_leaves_a_blast_that_bites() {
+    // What keeping the rhythm is worth - and what every upgrade trades away,
+    // since only the plain attack makes one.
+    assert_eq!(blast_damage_after_kill(2), COMBO_BLAST_DAMAGE);
+}
+
+#[test]
+fn an_ordinary_kill_leaves_a_blast_that_does_not() {
+    assert_eq!(blast_damage_after_kill(0), 0.0, "a plain death left a live blast");
+}
+
+#[test]
+fn a_live_blast_bites_once_however_long_it_covers_you() {
+    // It grows over a hundred ticks; damage on each of them would make the
+    // finisher worth more than a wall. Placed by hand rather than earned, so
+    // the swing that would have made it cannot also reach the target.
+    const MARK: f32 = 777_777.0;
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    clear_arena(&mut game);
+
+    let v = game.viewport;
+    let mut target = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    target.body.y = v.hper(GROUND_Y_PCT) - target.body.h;
+    target.body.x = game.players[0].body.x + v.wper(40.0);
+    target.hp = MARK;
+    target.hpmax = MARK;
+    target.speed_multiplier = 0.0;
+    let at = target.body;
+    game.zombies.push(target);
+    game.flyers.clear();
+
+    game.explosions.push(Explosion::lethal(
+        at.x,
+        at.y,
+        &v,
+        COMBO_BLAST_DAMAGE,
+        4242,
+    ));
+
+    for _ in 0..120 {
+        game.flyers.clear();
+        game.tick(&idle());
+    }
+    let left = game
+        .zombies
+        .iter()
+        .find(|z| z.hpmax == MARK)
+        .expect("the target wandered off")
+        .hp;
+    assert_eq!(MARK - left, COMBO_BLAST_DAMAGE, "exactly one bite");
 }

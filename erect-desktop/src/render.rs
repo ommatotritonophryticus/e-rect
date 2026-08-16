@@ -262,16 +262,59 @@ impl Renderer {
         for player in game.players.iter().filter(|p| !p.dead) {
             let body = on_screen(&player.body, cam);
             self.draw_actor(v, &body, mq(player.color.shaded(player.hp / 255.0)));
-            // Melee box: white with a black outline, like the original.
-            let gun = on_screen(&player.gun, cam);
-            draw_rectangle(
-                gun.x,
-                gun.y - v.hper(0.1),
-                gun.w + v.wper(0.2),
-                gun.h + v.hper(0.2),
-                BLACK,
-            );
-            draw_rectangle(gun.x, gun.y, gun.w, gun.h, mq(player.gun_color()));
+            // Thrown squares and placed boxes, in the player's own colour so
+            // it is obvious in co-op whose they are.
+            let mine = mq(player.color);
+            for b in game.bullets.iter().filter(|b| b.owner == player.index) {
+                let b = on_screen(&b.body, cam);
+                self.draw_actor(v, &b, mine);
+            }
+            for t in game.traps.iter().filter(|t| t.owner == player.index) {
+                let t = on_screen(&t.body, cam);
+                self.draw_actor(v, &t, mine);
+            }
+
+            // Melee box: white with a black outline, like the original. A
+            // two-sided swing puts out a second one behind the player.
+            let color = mq(player.gun_color());
+            for gun in player.strike_boxes() {
+                let gun = on_screen(gun, cam);
+                draw_rectangle(
+                    gun.x,
+                    gun.y - v.hper(0.1),
+                    gun.w + v.wper(0.2),
+                    gun.h + v.hper(0.2),
+                    BLACK,
+                );
+                draw_rectangle(gun.x, gun.y, gun.w, gun.h, color);
+            }
+        }
+
+        // The three standing options, if the lull is offering any. Drawn like
+        // actors because that is what they are to the player: things to hit.
+        if let Some(offer) = game.offer.as_ref() {
+            let size = v.hper(4.0);
+            // Dim until a hit on one counts. The wave ends mid-swing, so they
+            // arrive inside an attack that was aimed at something else; showing
+            // them inert says wait rather than surprising the player with a
+            // choice they did not make.
+            let armed = offer.armed(game.timer);
+            let face = if armed {
+                WHITE
+            } else {
+                Color::new(0.42, 0.42, 0.42, 1.0)
+            };
+            for choice in offer.choices.iter() {
+                let body = on_screen(&choice.body, cam);
+                self.draw_actor(v, &body, face);
+                let label = if choice.is_upgrade(game.players[0].attack) {
+                    format!("{} {}", choice.kind.label(), choice.level)
+                } else {
+                    choice.kind.label().to_string()
+                };
+                let x = body.x + body.w / 2.0 - self.text_width(&label, size) / 2.0;
+                draw_text_ex(&label, x, body.y - v.hper(2.0), self.params(size, face));
+            }
         }
 
         // A blind wave hides the enemies themselves. The player, its attacks,

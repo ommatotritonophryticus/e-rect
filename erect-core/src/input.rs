@@ -13,6 +13,12 @@ pub struct PlayerIntent {
     pub jump: bool,
     pub slam: bool,
     pub attack: bool,
+    /// The attack button held down, as opposed to the edge above.
+    ///
+    /// Only the thrown attack reads it, and only to keep firing. Every other
+    /// kind wants exactly one swing per press: a held button that kept swinging
+    /// would make the combo impossible to break out of.
+    pub attack_held: bool,
     pub dash: bool,
 }
 
