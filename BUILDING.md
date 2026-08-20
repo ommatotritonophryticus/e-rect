@@ -8,6 +8,18 @@ tools/release.sh                 # everything
 tools/release.sh psp macos       # just these
 ```
 
+The browser build is separate, because it is a different kind of thing - a page
+rather than an archive:
+
+```
+tools/web.sh                     # build into dist/web
+tools/web.sh serve               # build, then host it on every interface
+```
+
+`serve` binds to every address and prints them, because the reason this target
+exists is to open the game on a phone - and a phone cannot reach another
+machine's localhost.
+
 Each target lands in `dist/` as both a directory and a zip of it, laid out the
 way it is meant to be installed.
 
@@ -20,12 +32,31 @@ way it is meant to be installed.
 | Linux x86_64 | Debian 12 container | `tools/docker/Dockerfile` |
 | Linux aarch64 | Debian 12 container | same |
 | Windows x86_64 | same container, mingw | same |
+| Browser (wasm) | `tools/web.sh` | `web/` |
 
 The three cross targets go through a container on purpose. A Linux binary
 built there links against Debian 12's glibc, which is a floor you can state in
 a README; one built against whatever the host has is a binary whose
 requirements nobody knows. The Windows build needs mingw, and the container is
 where a pinned mingw lives.
+
+## The browser build is deliberately silent
+
+It carries no sound and forgets its settings when the tab closes. Both are the
+same missing thing: a browser has no filesystem to read packs from and no audio
+device to hand the mixer, and the game has always treated sound as optional -
+`Sound::start` returning an error is a supported outcome, not a failure.
+
+What it does carry is the phone layout: a letterboxed field with a drawn pad
+under it, which is the thing worth testing and the thing an Android build would
+need first. Native builds show the same layout with **F2**, so it can be checked
+with a mouse.
+
+```
+rustup target add wasm32-unknown-unknown
+```
+
+is the only extra prerequisite.
 
 ## Prerequisites
 
@@ -89,12 +120,48 @@ when you move.
 cargo test
 ```
 
-Runs on the host and covers `erect-core` and `erect-audio` — 95 tests. The
-frontends are not covered; they are the part a test cannot see.
+Runs on the host and covers `erect-core` and `erect-audio` — 253 tests. The
+frontends are mostly not covered; drawing is the part a test cannot see.
 
 `erect-psp` is excluded from the workspace, because it only builds for
 `mipsel-sony-psp` and its presence would break a plain `cargo build`. Build it
 from inside its own directory.
+
+### Checking what actually reaches the screen
+
+A marker the renderer never draws looks exactly like a working one from the
+test suite. The desktop frontend can run itself and save what it drew:
+
+```
+cargo run --release -p erect-desktop --features harness
+```
+
+with `ERECT_HARNESS` set, comma separated:
+
+| key | meaning |
+| --- | --- |
+| `wave=N` | start there, through the developer parameters |
+| `score=N` | start with that score |
+| `frames=N` | how long to run before stopping |
+| `out=PATH` | save a PNG at the end |
+| `at=N:PATH` | save one at frame `N` |
+| `on_elite=PATH` | save the frame a rolled heavy is announced |
+| `alive` | keep the players standing |
+| `boons` | hand the players every standing upgrade |
+| `screen=dev\|title` | open that menu instead of playing, to look at a layout |
+| `wall=pull\|push` | give them a modified wall and raise one every 90 ticks |
+| `fight` | swing and follow the nearest enemy |
+
+`alive` and `fight` are usually both wanted: nothing drives the player
+otherwise, and a wave only spawns as fast as the field is cleared, so a run
+that kills nothing stalls at the crowd limit and never reaches its later half.
+
+```
+ERECT_HARNESS="wave=7,alive,fight,frames=2000,on_elite=/tmp/heavy.png" \
+  cargo run --release -p erect-desktop --features harness
+```
+
+The feature is off by default and compiled out of every shipped build.
 
 ## Known noise
 

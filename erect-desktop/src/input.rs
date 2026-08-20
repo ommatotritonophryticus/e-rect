@@ -4,9 +4,13 @@
 //! both polled, so instead of dispatching events we build one `InputFrame` per
 //! rendered frame: `held` for movement, `pressed` for one-shot actions.
 
-use erect_core::config::{GAMEPAD_DEADZONE, MAX_PLAYERS};
+use erect_core::config::MAX_PLAYERS;
+// Only the physical-pad path reads the deadzone, and a browser has no pads.
+#[cfg(not(target_arch = "wasm32"))]
+use erect_core::config::GAMEPAD_DEADZONE;
 use erect_core::input::{InputFrame, MenuIntent, PlayerIntent};
 use erect_core::settings::SchemeInfo;
+#[cfg(not(target_arch = "wasm32"))]
 use gilrs::{Axis, Button, Gilrs};
 use macroquad::prelude::*;
 
@@ -37,6 +41,9 @@ struct PadState {
 }
 
 pub struct InputReader {
+    /// Absent in a browser: there is no gamepad subsystem to ask, and the pad
+    /// on screen is what serves that role there.
+    #[cfg(not(target_arch = "wasm32"))]
     gilrs: Option<Gilrs>,
     prev: [PadState; MAX_PLAYERS],
     cur: [PadState; MAX_PLAYERS],
@@ -45,10 +52,10 @@ pub struct InputReader {
 
 impl InputReader {
     pub fn new() -> Self {
-        // A missing gamepad subsystem must not stop the game from running.
-        let gilrs = Gilrs::new().ok();
         Self {
-            gilrs,
+            // A missing gamepad subsystem must not stop the game from running.
+            #[cfg(not(target_arch = "wasm32"))]
+            gilrs: Gilrs::new().ok(),
             prev: [PadState::default(); MAX_PLAYERS],
             cur: [PadState::default(); MAX_PLAYERS],
             connected: [false; MAX_PLAYERS],
@@ -59,7 +66,12 @@ impl InputReader {
         self.prev = self.cur;
         self.cur = [PadState::default(); MAX_PLAYERS];
         self.connected = [false; MAX_PLAYERS];
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_gilrs();
+    }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_gilrs(&mut self) {
         let Some(gilrs) = self.gilrs.as_mut() else {
             return;
         };

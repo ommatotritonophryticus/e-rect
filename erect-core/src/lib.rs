@@ -21,6 +21,7 @@ extern crate alloc;
 pub mod attack;
 pub mod audio;
 pub mod backdrop;
+pub mod boon;
 pub mod color;
 pub mod config;
 pub mod dev;
@@ -30,6 +31,7 @@ pub mod geom;
 pub mod input;
 pub mod menu;
 pub mod offer;
+pub mod recipe;
 pub mod settings;
 pub mod waves;
 

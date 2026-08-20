@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>E-Rect</title>
+<!-- viewport-fit=cover so a notch does not letterbox the page itself; the
+     layout keeps its own margin away from the edges. -->
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  /* Without this a drag on the pad pans and pinches the page instead of
+     reaching the game, which is the single thing that breaks touch games in a
+     browser. The rest stops a long press selecting or offering a callout. */
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    outline: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="glcanvas" tabindex="1"></canvas>
+<script src="mq_js_bundle.js"></script>
+<script>
+  // The canvas is sized in device pixels, not CSS pixels: on a phone those
+  // differ by two or three, and the game lays itself out from whatever size it
+  // is handed. Re-measured on rotate, and when the browser chrome slides away.
+  function fit() {
+    const c = document.getElementById("glcanvas");
+    const r = window.devicePixelRatio || 1;
+    // innerWidth can still be zero when this runs inside a frame that has not
+    // been laid out yet. Taking it at face value hands the game a zero-sized
+    // view it never recovers from, since the size is read once at start-up.
+    const w = window.innerWidth || document.documentElement.clientWidth;
+    const h = window.innerHeight || document.documentElement.clientHeight;
+    if (w === 0 || h === 0) return false;
+    c.width = Math.floor(w * r);
+    c.height = Math.floor(h * r);
+    return true;
+  }
+  window.addEventListener("resize", fit);
+  window.addEventListener("orientationchange", fit);
+  // Start once there is a size to start with, rather than whenever this script
+  // happens to run.
+  (function start() {
+    if (fit()) {
+      load("erect.wasm");
+    } else {
+      requestAnimationFrame(start);
+    }
+  })();
+</script>
+</body>
+</html>

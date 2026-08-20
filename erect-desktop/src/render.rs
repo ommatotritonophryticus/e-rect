@@ -130,7 +130,10 @@ impl Renderer {
     pub fn render(&self, game: &Game, pads_connected: [bool; MAX_PLAYERS]) {
         let v = &game.viewport;
 
-        clear_background(mq(game.background.to_rgb()));
+        // Fills the viewport rather than the window. On a phone the game is a
+        // rectangle inside a black screen, and clearing everything would paint
+        // over the pad's background too. On a desktop the two are the same.
+        draw_rectangle(0.0, 0.0, v.w, v.h, mq(game.background.to_rgb()));
 
         // Parallax skyline, behind everything. Drawn before the ground and
         // ceiling bands so those trim it top and bottom for free.
@@ -163,7 +166,11 @@ impl Renderer {
     fn render_menu(&self, game: &Game, menu: &Menu, pads_connected: [bool; MAX_PLAYERS]) {
         let v = &game.viewport;
         let rows = game.menu_rows(pads_connected);
-        let size = v.hper(6.0);
+        // Capped by the row pitch, so a menu that tightened itself to fit more
+        // rows does not go on drawing text at a size that overlaps them. The
+        // ordinary pitch leaves more room than this asks for, so every other
+        // menu is untouched. The PSP renderer has always sized this way.
+        let size = v.hper(6.0).min(v.hper(menu.row_h_pct * 0.85));
 
         for (i, row) in rows.iter().enumerate() {
             let selected = i == menu.index;
@@ -230,18 +237,27 @@ impl Renderer {
 
     fn render_dev_menu(&self, game: &Game, pads_connected: [bool; MAX_PLAYERS]) {
         let v = &game.viewport;
-        self.draw_centered_shadowed(v, "DEV", 16.0, v.hper(8.0), WHITE);
+        self.draw_centered_shadowed(v, "DEV", 11.0, v.hper(6.0), WHITE);
         self.render_menu(game, &game.dev_menu, pads_connected);
 
         let hint = Color::new(0.78, 0.78, 0.78, 1.0);
         let size = v.hper(3.5);
-        self.draw_centered(v, "LEFT / RIGHT TO CHANGE", 84.0, size, hint);
-        self.draw_centered(v, "ESC OR B TO GO BACK", 89.0, size, hint);
+        // Both on the floor band, clear of the last row: the menu now reaches
+        // 81% and the old 84% sat in the descenders of BACK.
+        self.draw_centered(v, "LEFT / RIGHT TO CHANGE", 90.0, size, hint);
+        self.draw_centered(v, "ESC OR B TO GO BACK", 95.0, size, hint);
     }
 
     fn render_session(&self, game: &Game) {
         let v = &game.viewport;
         let cam = game.camera_x;
+
+        // Named on arrival, high enough to clear the countdown's slot. A
+        // rolled enemy is the one thing on the field that cannot be read off
+        // its colour, so it gets the only words the fight ever prints.
+        if let Some(name) = game.elite_notice() {
+            self.draw_centered_shadowed(v, name, 16.0, v.hper(4.5), WHITE);
+        }
 
         if game.waves.countdown >= 0 {
             self.draw_centered_shadowed(
@@ -261,6 +277,29 @@ impl Renderer {
 
         for player in game.players.iter().filter(|p| !p.dead) {
             let body = on_screen(&player.body, cam);
+            // Says the next touch is free. A white ring with a black gap cut
+            // out of it - the gap is the whole point, because WHITE is in the
+            // palette and a ring without one would just make a white player
+            // look bigger. The actor's own outline cannot do this job: it is a
+            // drop shadow, drawn on two sides only.
+            if player.shield_up(game.timer) {
+                let halo = v.wper(0.9);
+                let gap = v.wper(0.25);
+                draw_rectangle(
+                    body.x - halo,
+                    body.y - halo,
+                    body.w + halo * 2.0,
+                    body.h + halo * 2.0,
+                    WHITE,
+                );
+                draw_rectangle(
+                    body.x - gap,
+                    body.y - gap,
+                    body.w + gap * 2.0,
+                    body.h + gap * 2.0,
+                    BLACK,
+                );
+            }
             self.draw_actor(v, &body, mq(player.color.shaded(player.hp / 255.0)));
             // Thrown squares and placed boxes, in the player's own colour so
             // it is obvious in co-op whose they are.
@@ -307,11 +346,7 @@ impl Renderer {
             for choice in offer.choices.iter() {
                 let body = on_screen(&choice.body, cam);
                 self.draw_actor(v, &body, face);
-                let label = if choice.is_upgrade(game.players[0].attack) {
-                    format!("{} {}", choice.kind.label(), choice.level)
-                } else {
-                    choice.kind.label().to_string()
-                };
+                let label = choice.label(game.players[0].attack);
                 let x = body.x + body.w / 2.0 - self.text_width(&label, size) / 2.0;
                 draw_text_ex(&label, x, body.y - v.hper(2.0), self.params(size, face));
             }
@@ -342,14 +377,10 @@ impl Renderer {
         if flicker {
             for player in game.players.iter().filter(|p| p.field.active) {
                 let b = on_screen(&player.field.body, cam);
-                draw_rectangle(
-                    b.x - v.wper(0.2),
-                    b.y - v.hper(0.2),
-                    b.w + v.wper(0.4),
-                    b.h + v.hper(0.4),
-                    Color::new(0.03, 0.03, 0.03, 1.0),
-                );
-                draw_rectangle(b.x, b.y, b.w, b.h, WHITE);
+                // Bare slab, no outline. A modified wall says which one it is
+                // by its colour, and that is the only warning the field gets
+                // before being moved.
+                draw_rectangle(b.x, b.y, b.w, b.h, mq(player.boons.wall.color()));
             }
             for e in game.explosions.iter().filter(|e| !e.finished) {
                 let b = on_screen(&e.body, cam);

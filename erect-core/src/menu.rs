@@ -38,6 +38,12 @@ pub enum MenuAction {
     AdjustDevPlayers,
     AdjustDevAttack,
     AdjustDevAttackLevel,
+    /// One row that turns every standing upgrade on, or all of them off.
+    AdjustDevAllBoons,
+    AdjustDevDoubleJump,
+    AdjustDevDashFree,
+    AdjustDevShield,
+    AdjustDevWall,
     /// Begin a run on the parameters set above.
     StartDevRun,
 }
@@ -63,6 +69,11 @@ impl MenuRow {
                 | MenuAction::AdjustDevPlayers
                 | MenuAction::AdjustDevAttack
                 | MenuAction::AdjustDevAttackLevel
+                | MenuAction::AdjustDevAllBoons
+                | MenuAction::AdjustDevDoubleJump
+                | MenuAction::AdjustDevDashFree
+                | MenuAction::AdjustDevShield
+                | MenuAction::AdjustDevWall
         )
     }
 }

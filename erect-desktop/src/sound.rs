@@ -302,6 +302,20 @@ fn build_stream(
         .map_err(|e| format!("cannot build stream: {e}"))
 }
 
+/// Looks for the packs next to the executable first, so a shipped build works,
+/// then in the source tree for `cargo run`.
+pub fn packs_dir() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join("packs");
+            if beside.is_dir() {
+                return beside;
+            }
+        }
+    }
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../packs")
+}
+
 #[cfg(test)]
 mod probe {
     //! Renders a scripted match through the real pack and the real mixer, so
@@ -315,7 +329,7 @@ mod probe {
     #[test]
     fn renders_a_scripted_match_to_a_wav() {
         let spec = &packs::PACKS[0];
-        let dir = super::super::packs_dir().join(spec.dir).join("desktop");
+        let dir = super::packs_dir().join(spec.dir).join("desktop");
         if !dir.is_dir() {
             eprintln!("pack not built, skipping: {dir:?}");
             return;

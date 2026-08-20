@@ -274,6 +274,9 @@ pub enum WaveAction {
     /// Wave 15's alternative: one shedder boss instead of that wave's three
     /// ground bosses. Rolled, so the wave is not the same fight every run.
     SpawnShedderBoss,
+    /// One rolled heavy, from [`ELITE_FIRST_WAVE`] on. What it turns out to be
+    /// is the caller's business - the manager only decides when.
+    SpawnElite,
     ClearWave,
 }
 
@@ -286,6 +289,8 @@ pub struct WaveManager {
     pub forced_kind: Option<WaveKind>,
     pub forced_rule: Option<WaveRule>,
     boss_due: bool,
+    /// This wave has not had its rolled heavy yet.
+    elite_due: bool,
     /// -1 when no countdown is running, otherwise the number still displayed.
     pub countdown: i32,
     countdown_timer: i32,
@@ -300,6 +305,7 @@ impl Default for WaveManager {
             forced_kind: None,
             forced_rule: None,
             boss_due: true,
+            elite_due: true,
             countdown: -1,
             countdown_timer: 0,
             spawn_timer: 0,
@@ -340,6 +346,7 @@ impl WaveManager {
         let (kind, rule) = (WaveKind::roll(wave, rng), WaveRule::roll(wave, rng));
         self.kind = self.forced_kind.unwrap_or(kind);
         self.rule = self.forced_rule.unwrap_or(rule);
+        self.elite_due = true;
     }
 
     /// Advances pacing by one tick and reports what should happen.
@@ -363,6 +370,19 @@ impl WaveManager {
         if self.spawn_timer > 0 {
             self.spawn_timer -= 1;
             return WaveAction::Idle;
+        }
+
+        // The wave's own heavy, once, on the way through. Boss waves are
+        // skipped: three bosses and a rolled heavy in one wave is two headlines
+        // reading over each other.
+        if self.elite_due
+            && wave >= crate::config::ELITE_FIRST_WAVE
+            && wave % 5 != 0
+            && spawn_count >= wave * 10 / crate::config::ELITE_ENTRY_FRACTION
+        {
+            self.elite_due = false;
+            self.spawn_timer = rng.range(6, 60);
+            return WaveAction::SpawnElite;
         }
 
         if spawn_count < wave * 10 {

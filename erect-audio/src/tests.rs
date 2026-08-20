@@ -242,10 +242,10 @@ fn the_two_volume_controls_act_independently_on_the_mix() {
 }
 
 #[test]
-fn both_packs_are_described_consistently() {
+fn every_pack_is_described_consistently() {
     use crate::packs::{choose, LAYER_IDS, PACKS};
 
-    assert_eq!(PACKS.len(), 2, "two packs ship");
+    assert!(PACKS.len() >= 2, "a run should have something to choose between");
     for pack in PACKS.iter() {
         assert!(pack.loop_samples > 0, "{} has no loop", pack.dir);
         assert_eq!(pack.desktop_gains_db.len(), LAYER_IDS.len());
@@ -260,14 +260,22 @@ fn both_packs_are_described_consistently() {
         );
         assert_eq!(pack.sfx.len(), 3);
     }
-    assert_ne!(PACKS[0].dir, PACKS[1].dir);
-    assert_ne!(
-        PACKS[0].loop_samples, PACKS[1].loop_samples,
-        "the two compositions are different lengths"
-    );
+    // What a copy-pasted entry would look like. Loop length is deliberately not
+    // checked: two packs rendered from the same project template share it
+    // honestly, and pack1 and pack3 do.
+    for (i, a) in PACKS.iter().enumerate() {
+        for b in PACKS.iter().skip(i + 1) {
+            assert_ne!(a.dir, b.dir, "two packs point at the same directory");
+            assert_ne!(
+                a.psp_gains_db, b.psp_gains_db,
+                "{} and {} carry the same levels, which no two mixes do",
+                a.dir, b.dir
+            );
+        }
+    }
 
     // Choosing reaches every pack and never falls off the end.
-    let mut seen = [false; 2];
+    let mut seen = alloc::vec![false; PACKS.len()];
     for seed in 0..64u64 {
         let picked = choose(seed);
         let idx = PACKS.iter().position(|p| p.dir == picked.dir).unwrap();
@@ -284,25 +292,28 @@ fn pack_choice_spreads_even_when_the_clock_barely_moves() {
     // and leaves the low ones alone, which is exactly the case a plain
     // `seed % 2` gets wrong - and did, until the seed was hashed.
     let spread = |seeds: alloc::vec::Vec<u64>| {
-        let mut counts = [0usize; 2];
+        let mut counts = alloc::vec![0usize; PACKS.len()];
         for s in &seeds {
             let picked = choose(*s);
             counts[PACKS.iter().position(|p| p.dir == picked.dir).unwrap()] += 1;
         }
         counts
     };
+    // Sixty-four draws over however many packs ship; a third of the even share
+    // is low enough not to be flaky and high enough to catch clustering.
+    let floor = 64 / PACKS.len() / 3;
 
     // Consecutive microseconds.
     let c = spread((1_000_000u64..1_000_064).collect());
-    assert!(c[0] > 8 && c[1] > 8, "consecutive seeds clustered: {c:?}");
+    assert!(c.iter().all(|n| *n > floor), "consecutive seeds clustered: {c:?}");
 
     // A clock that only ever lands on multiples of 1000.
     let c = spread((0..64u64).map(|i| 5_000_000 + i * 1000).collect());
-    assert!(c[0] > 8 && c[1] > 8, "quantised seeds clustered: {c:?}");
+    assert!(c.iter().all(|n| *n > floor), "quantised seeds clustered: {c:?}");
 
     // And on multiples of 65536, where the bottom sixteen bits never change.
     let c = spread((0..64u64).map(|i| i * 65536).collect());
-    assert!(c[0] > 8 && c[1] > 8, "coarse seeds clustered: {c:?}");
+    assert!(c.iter().all(|n| *n > floor), "coarse seeds clustered: {c:?}");
 }
 
 #[test]

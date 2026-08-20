@@ -6,11 +6,12 @@
 //! the original instead of being restructured around a command buffer.
 
 use alloc::format;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::attack::AttackKind;
+use crate::boon::{WallMod, SHIELD_COOLDOWN_TICKS};
 use crate::audio::{AudioEvent, AudioQueue, MusicState, Situation};
 use crate::backdrop::BackdropBlock;
 use crate::color::{EaseColor, Rgb};
@@ -20,7 +21,8 @@ use crate::entities::*;
 use crate::geom::{Body, Viewport};
 use crate::input::InputFrame;
 use crate::menu::{Menu, MenuAction, MenuRow};
-use crate::offer::{Offer, OFFER_SCORE_STEP};
+use crate::recipe::{Recipe, BROOD_MAX};
+use crate::offer::{Offer, OfferItem, OFFER_SCORE_STEP};
 use crate::settings::{SchemeInfo, Settings, VolumeChannel};
 use crate::waves::{FlyerKind, GroundKind, WaveAction, WaveManager, WaveRule};
 
@@ -54,7 +56,15 @@ pub struct Game {
     pub viewport: Viewport,
     pub state: State,
     pub settings: Settings,
+    /// What the rolled heavy on the field turned out to be, and when it
+    /// arrived. A combination has no colour to be recognised by, so the one
+    /// time it can be named is when it walks in.
+    pub elite_notice: Option<(String, i64)>,
     pub rng: Rng,
+    /// What rolled enemies and their young are drawn from. Kept apart from the
+    /// main generator for the same reason the offer is: what the player does in
+    /// a fight must not shift which enemy the next roll produces.
+    pub elite_rng: Rng,
 
     pub players: Vec<Player>,
     pub zombies: Vec<Zombie>,
@@ -179,6 +189,7 @@ impl Game {
             viewport,
             state: State::Title,
             settings,
+            elite_notice: None,
             rng: Rng::new(seed),
             players: Vec::new(),
             zombies: Vec::new(),
@@ -204,7 +215,11 @@ impl Game {
             pause_menu: Menu::new(48.0),
             confirm_menu: Menu::new(52.0),
             // Nine rows, so a tighter pitch than the rest.
-            dev_menu: Menu::tight(20.0, 7.0),
+            // Fourteen rows on a 480x272 panel. At the old 7% pitch the last
+            // five would sit under the floor band; 5% puts the bottom row at
+            // 81% and still leaves 11.6px of text in a 13.6px slot, which is
+            // above the readable floor the PSP renderer holds everything to.
+            dev_menu: Menu::tight(16.0, 5.0),
             dev: DevSetup::default(),
             schemes,
             max_players,
@@ -215,6 +230,7 @@ impl Game {
             next_strike: 1,
             next_offer_score: OFFER_SCORE_STEP,
             offer_rng: Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15),
+            elite_rng: Rng::new(seed ^ 0xB5AD_4ECE_DA1C_E2A9),
             last_state: State::Title,
             audio_rng: Rng::new(seed ^ 0x243F_6A88_85A3_08D3),
         };
@@ -340,11 +356,21 @@ impl Game {
         self.offer = None;
         self.next_offer_score = OFFER_SCORE_STEP;
         self.popups.clear();
+        self.elite_notice = None;
         self.timer = 0;
         self.wave = 1;
         self.waves.begin_wave(1, &mut self.rng);
         self.spawn_count = 0;
         self.waves.reset();
+    }
+
+    /// A switch as the menu prints it.
+    fn on_off(on: bool) -> &'static str {
+        if on {
+            "ON"
+        } else {
+            "OFF"
+        }
     }
 
     /// Opens the developer menu, and clears whatever the last visit pinned so
@@ -372,6 +398,7 @@ impl Game {
         for p in self.players.iter_mut() {
             p.attack = self.dev.attack;
             p.attack_level = self.dev.attack_level;
+            p.boons = self.dev.boons;
         }
 
         self.waves.forced_kind = self.dev.kind;
@@ -591,6 +618,9 @@ impl Game {
         let ground = v.hper(GROUND_Y_PCT);
         let camera = self.camera_x;
         let (kind, level) = (self.players[0].attack, self.players[0].attack_level);
+        // What is already held comes off the table. Boons are one-time, so
+        // offering one twice would be offering nothing.
+        let held = self.players[0].boons;
         let timer = self.timer;
         self.offer = Some(Offer::roll(
             &v,
@@ -598,6 +628,7 @@ impl Game {
             ground,
             kind,
             level,
+            held,
             timer,
             &mut self.offer_rng,
         ));
@@ -611,9 +642,16 @@ impl Game {
         let choice = offer.choices[index];
         let v = self.viewport;
         let (x, y) = (choice.body.x, choice.body.y);
+        // Everyone gets it: one offer stands in the lull and either player may
+        // be the one to reach it.
         for p in self.players.iter_mut() {
-            p.attack = choice.kind;
-            p.attack_level = choice.level;
+            match choice.item {
+                OfferItem::Attack { kind, level } => {
+                    p.attack = kind;
+                    p.attack_level = level;
+                }
+                OfferItem::Boon(boon) => p.boons.take(boon),
+            }
         }
         self.explosions.push(Explosion::new(x, y, &v));
         self.audio.push(AudioEvent::Slam);
@@ -743,16 +781,70 @@ impl Game {
     /// blasts too - a balance change nobody asked for.
     ///
     /// Returns true when this hit ended the run.
-    fn damage_player(&mut self, pi: usize, amount: f32, source: &Body) -> bool {
-        if self.players[pi].invulnerable {
+    pub(crate) fn damage_player(
+        &mut self,
+        pi: usize,
+        amount: f32,
+        source: &Body,
+        reach: Reach,
+    ) -> bool {
+        if self.players[pi].untouchable(self.timer, reach) {
             // Still thrown about, just unhurt: being untouchable should not
             // also make the player immovable.
+            //
+            // A dash is the exception. It is a committed trajectory - no
+            // steering, no second dash out of the first - and a throw would set
+            // `ay` and lift the player straight out of their own dash. The
+            // melee path has always refused to move a dashing player; this is
+            // the same rule reaching the sources that never went through it.
+            if !self.players[pi].in_dash_window(self.timer) {
+                self.knock_back(pi, source);
+            }
+            return false;
+        }
+        // Absorbs the touch, then goes down for a second. Checked after every
+        // untouchable case above, so nothing that could not have landed anyway
+        // spends it - a shield is for the hits that would otherwise get through. The throw still happens: being shielded should
+        // not also mean being immovable, and the throw is what carries the
+        // player out of reach of the next one.
+        if self.players[pi].boons.shield && self.timer >= self.players[pi].shield_ready_at {
+            self.players[pi].shield_ready_at = self.timer + SHIELD_COOLDOWN_TICKS;
             self.knock_back(pi, source);
             return false;
         }
         self.players[pi].hp -= amount * self.waves.rule.damage_scale();
         self.knock_back(pi, source);
         self.players[pi].hp < 0.0 && self.down_player(pi)
+    }
+
+    /// A modified wall takes hold of the whole field the moment it goes up.
+    ///
+    /// One shove, not a standing force: every enemy is handed a short burst in
+    /// one direction and then goes back to doing whatever it was doing. A
+    /// lasting pull would be a tractor beam and a lasting push would make the
+    /// wall unapproachable - neither is a wall.
+    ///
+    /// Called from both places a wall can be raised, which is why it is a
+    /// method rather than a few lines at each: there are two, and a third would
+    /// be easy to add without noticing this.
+    fn wall_shove(&mut self, pi: usize) {
+        let wall = self.players[pi].boons.wall;
+        if wall == WallMod::Plain {
+            return;
+        }
+        let centre = self.players[pi].body.x + self.players[pi].body.w / 2.0;
+        // Pull sends each enemy toward that point, push sends it the other way;
+        // both are read off which side the enemy is standing on.
+        let sign = if wall == WallMod::Pull { 1.0 } else { -1.0 };
+        let speed = self.viewport.wper(WALL_SHOVE_AX_PCT);
+        for z in self.zombies.iter_mut() {
+            let towards = if centre > z.body.x + z.body.w / 2.0 { 1.0 } else { -1.0 };
+            z.ax = towards * sign * speed;
+        }
+        for f in self.flyers.iter_mut() {
+            let towards = if centre > f.body.x + f.body.w / 2.0 { 1.0 } else { -1.0 };
+            f.ax = towards * sign * speed;
+        }
     }
 
     /// Throws a player up and away from whatever just hit them.
@@ -781,6 +873,17 @@ impl Game {
             return true;
         }
         false
+    }
+
+    /// The rolled heavy's name, while it is still worth showing.
+    pub fn elite_notice(&self) -> Option<&str> {
+        self.elite_notice
+            .as_ref()
+            // The clock goes back to zero at the start of a run, so an age is
+            // only meaningful forwards. Read the other way a stale notice looks
+            // arbitrarily fresh.
+            .filter(|(_, at)| (0..ELITE_NOTICE_TICKS).contains(&(self.timer - at)))
+            .map(|(text, _)| text.as_str())
     }
 
     /* ---------------- per-tick entry point ---------------- */
@@ -963,6 +1066,34 @@ impl Game {
                     action: MenuAction::AdjustDevAttackLevel,
                     swatch: None,
                 },
+                // The whole set on one row, then each on its own. Reaching a
+                // boon in a real run costs tens of thousands of points, and
+                // most of what wants testing wants all of them at once.
+                MenuRow {
+                    label: format!("ALL UPGRADES: {}", Self::on_off(self.dev.all_boons())),
+                    action: MenuAction::AdjustDevAllBoons,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("DOUBLE JUMP: {}", Self::on_off(self.dev.boons.double_jump)),
+                    action: MenuAction::AdjustDevDoubleJump,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("FREE DASH: {}", Self::on_off(self.dev.boons.dash_free)),
+                    action: MenuAction::AdjustDevDashFree,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("SHIELD: {}", Self::on_off(self.dev.boons.shield)),
+                    action: MenuAction::AdjustDevShield,
+                    swatch: None,
+                },
+                MenuRow {
+                    label: format!("WALL: {}", self.dev.wall_label()),
+                    action: MenuAction::AdjustDevWall,
+                    swatch: None,
+                },
                 MenuRow {
                     label: "START".to_string(),
                     action: MenuAction::StartDevRun,
@@ -1087,6 +1218,13 @@ impl Game {
             Some(MenuAction::AdjustDevPlayers) => self.dev.adjust_players(dir, self.max_players),
             Some(MenuAction::AdjustDevAttack) => self.dev.cycle_attack(dir),
             Some(MenuAction::AdjustDevAttackLevel) => self.dev.adjust_attack_level(dir),
+            // Left and right do the same thing on a switch; there is no
+            // direction to a yes or a no.
+            Some(MenuAction::AdjustDevAllBoons) => self.dev.toggle_all_boons(),
+            Some(MenuAction::AdjustDevDoubleJump) => self.dev.toggle_double_jump(),
+            Some(MenuAction::AdjustDevDashFree) => self.dev.toggle_dash_free(),
+            Some(MenuAction::AdjustDevShield) => self.dev.toggle_shield(),
+            Some(MenuAction::AdjustDevWall) => self.dev.cycle_wall(dir),
             _ => {}
         }
     }
@@ -1113,6 +1251,11 @@ impl Game {
             Some(MenuAction::AdjustDevPlayers) => self.dev.adjust_players(1, self.max_players),
             Some(MenuAction::AdjustDevAttack) => self.dev.cycle_attack(1),
             Some(MenuAction::AdjustDevAttackLevel) => self.dev.adjust_attack_level(1),
+            Some(MenuAction::AdjustDevAllBoons) => self.dev.toggle_all_boons(),
+            Some(MenuAction::AdjustDevDoubleJump) => self.dev.toggle_double_jump(),
+            Some(MenuAction::AdjustDevDashFree) => self.dev.toggle_dash_free(),
+            Some(MenuAction::AdjustDevShield) => self.dev.toggle_shield(),
+            Some(MenuAction::AdjustDevWall) => self.dev.cycle_wall(1),
             Some(MenuAction::StartDevRun) => self.start_dev_run(),
             Some(MenuAction::Quit) => self.quit_requested = true,
             Some(MenuAction::Resume) => self.toggle_pause(),
@@ -1166,9 +1309,26 @@ impl Game {
             }
 
             let rule = self.waves.rule;
-            if intent.jump && self.players[i].grounded && rule != WaveRule::NoJumps {
-                self.players[i].ay = -v.hper(2.0);
-                self.audio.push(AudioEvent::Jump);
+            if intent.jump && rule != WaveRule::NoJumps {
+                // A jump off nothing is the same jump, paid for out of a stock
+                // that the next landing refills. The wave rule still decides
+                // first: a boon does not buy back a system the wave turned off.
+                let airborne = !self.players[i].grounded;
+                let can_jump = if airborne {
+                    let left = self.players[i].air_jumps;
+                    if left > 0 {
+                        self.players[i].air_jumps = left - 1;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+                if can_jump {
+                    self.players[i].ay = -v.hper(2.0);
+                    self.audio.push(AudioEvent::Jump);
+                }
             }
             if intent.slam {
                 match rule {
@@ -1180,6 +1340,9 @@ impl Game {
                             self.players[i].attacks_since_power_up += 1;
                             let body = self.players[i].body;
                             self.players[i].field.activate(&body, &v);
+                            self.wall_shove(i);
+                            // A wall is one action, and an enemy may only be caught by it once.
+                            self.players[i].strike_id = self.players[i].strike_id.wrapping_add(1).max(1);
                             self.audio.push(AudioEvent::Slam);
                         }
                     }
@@ -1193,7 +1356,13 @@ impl Game {
                         }
                         self.players[i].ay = v.hper(5.0);
                     }
-                    WaveRule::NoJumps | WaveRule::NoWall => {}
+                    WaveRule::NoWall => {}
+                    // Airborne, on every rule that still has a wall - the one
+                    // with no jumping included. Being up there was not the
+                    // player's choice on that wave, a hit put them there, and
+                    // down used to have nothing to do about it. Now it does the
+                    // ordinary thing: hurries the fall, and covers it, so the
+                    // landing that raises the wall cannot itself be punished.
                     _ if !self.players[i].grounded => {
                         self.players[i].field.readiness = true;
                         self.players[i].ay = v.hper(5.0);
@@ -1205,7 +1374,7 @@ impl Game {
             // first, and the direction is whichever way the player is facing.
             if intent.dash
                 && !self.players[i].dashing()
-                && self.players[i].dash_cooldown == 0
+                && (self.players[i].dash_cooldown == 0 || self.players[i].boons.dash_free)
                 && self.pay_for_dash(i)
             {
                 self.players[i].dash_ticks = DASH_TICKS;
@@ -1415,6 +1584,18 @@ impl Game {
                 f.body.x += self.camera_x;
                 self.flyers.push(f);
             }
+            WaveAction::SpawnElite => {
+                self.background.set_target(BG_FIGHT);
+                self.spawn_count += 1;
+                let recipe = Recipe::roll(self.wave, &mut self.elite_rng);
+                let mut z = recipe.build(&v, self.wave, self.timer, &mut self.elite_rng);
+                z.body.x += self.camera_x;
+                // Named on arrival and only then. The halo says "not off the
+                // list"; this says which one of the sixty-four it is, once,
+                // while there is still time to act on knowing.
+                self.elite_notice = Some((recipe.label(), self.timer));
+                self.zombies.push(z);
+            }
             WaveAction::ClearWave => self.on_wave_cleared(),
         }
     }
@@ -1448,11 +1629,15 @@ impl Game {
                 self.players[i].hp = (self.players[i].hp + hpmax * 0.25).min(hpmax);
             }
             self.players[i].grounded = true;
+            self.players[i].air_jumps = if self.players[i].boons.double_jump { 1 } else { 0 };
             if self.players[i].field.readiness && self.players[i].super_charges > 0 {
                 self.players[i].attacks_since_power_up += 1;
                 self.players[i].super_charges -= 1;
                 let body = self.players[i].body;
                 self.players[i].field.activate(&body, &v);
+                self.wall_shove(i);
+                // A wall is one action, and an enemy may only be caught by it once.
+                self.players[i].strike_id = self.players[i].strike_id.wrapping_add(1).max(1);
                 self.audio.push(AudioEvent::Slam);
             }
             self.players[i].field.readiness = false;
@@ -1478,7 +1663,12 @@ impl Game {
         let dx = if self.players[i].dashing() {
             self.players[i].dash_ticks -= 1;
             if self.players[i].dash_ticks == 0 {
-                self.players[i].dash_cooldown = DASH_COOLDOWN_TICKS;
+                // Left at zero when the dash is free, so the indicator does not
+                // spend a second saying "wait" about something already
+                // available. Energy is the only gate then.
+                if !self.players[i].boons.dash_free {
+                    self.players[i].dash_cooldown = DASH_COOLDOWN_TICKS;
+                }
                 // The shove and its immunity outlast the travel. `timer` only
                 // advances at the end of the tick, so this deadline covers the
                 // rest of this frame and then exactly DASH_GRACE_TICKS more.
@@ -1567,22 +1757,27 @@ impl Game {
             if let Some((attacker, source)) = self.find_attacker(&self.zombies[i].body) {
                 let by_field = source == HitSource::Field;
                 if by_field {
-                    // A boss loses a fixed share of its health, so a wall is
-                    // worth the same against a wave-25 boss as a wave-5 one.
-                    // Anything ordinary is simply finished: subtracting a flat
-                    // 255 left a full-health enemy at exactly zero, which is
-                    // not below zero and so not dead.
-                    if self.zombies[i].is_boss {
-                        self.zombies[i].hp -= self.zombies[i].hpmax * FIELD_BOSS_FRACTION;
-                    } else {
-                        self.zombies[i].hp = -1.0;
+                    // Once per wall, not once per tick. The field stands for
+                    // about seventeen ticks while it grows, and it used to set
+                    // health to -1 outright, which is the same however many
+                    // times it lands - so nothing ever noticed it landing over
+                    // and over. A number does notice: seventeen touches of 300
+                    // is five thousand.
+                    let wall = self.players[attacker].strike_id;
+                    if self.zombies[i].last_strike != wall {
+                        self.zombies[i].last_strike = wall;
+                        if self.zombies[i].is_boss {
+                            self.zombies[i].hp -= self.zombies[i].hpmax * FIELD_BOSS_FRACTION;
+                        } else {
+                            self.zombies[i].hp -= FIELD_DAMAGE;
+                        }
                     }
                 }
                 let first_hit = !self.zombies[i].hurt_once;
                 self.zombies[i].hurt_once = true;
                 if first_hit
                     && self.zombies[i].hp >= 0.0
-                    && self.zombies[i].behavior == Behavior::Blinker
+                    && self.zombies[i].behaviors.blink
                 {
                     self.blink_away(i);
                     continue;
@@ -1595,7 +1790,8 @@ impl Game {
                         let reward = 100 * self.wave;
                         (reward, format!("+{}", reward))
                     } else {
-                        (6, "+6".to_string())
+                        let reward = self.zombies[i].reward;
+                        (reward, format!("+{}", reward))
                     };
                     self.players[attacker].score += gain;
                     self.award_energy(attacker, gain);
@@ -1718,8 +1914,21 @@ impl Game {
                 // husk standing where the hit landed. Checked after the damage
                 // so the hit actually counts, and gated on surviving so the
                 // killing blow does not send a corpse across the field.
-                if self.zombies[i].behavior == Behavior::Shedder && self.zombies[i].hp >= 0.0 {
+                if self.zombies[i].behaviors.shed && self.zombies[i].hp >= 0.0 {
                     self.shed_and_flee(i);
+                }
+
+                // Answers the blow with young. Gated on `already`, so it is one
+                // brood per swing and not one per connecting tick: a swing
+                // covers an enemy for the better part of a dozen ticks, and
+                // paying that rate would fill the field from a single hit.
+                //
+                // The wall is left out for free by the same gate - it stamps
+                // its own identity on what it reaches before this runs - and
+                // that is the right answer anyway. The ultimate exists to clear
+                // a field, not to seed one.
+                if self.zombies[i].broods && !already && self.zombies[i].hp >= 0.0 {
+                    self.spawn_brood(i);
                 }
             }
 
@@ -1763,13 +1972,13 @@ impl Game {
                         continue;
                     }
                     let source = self.zombies[i].body;
-                    let ended = self.damage_player(pi, 16.0, &source);
+                    let ended = self.damage_player(pi, 16.0, &source, Reach::Normal);
                     if ended {
                         return true;
                     }
                     // Touching one is always enough to send it away, however
                     // many times it comes back.
-                    if self.zombies[i].behavior == Behavior::Blinker {
+                    if self.zombies[i].behaviors.blink {
                         self.blink_away(i);
                         break;
                     }
@@ -1787,30 +1996,41 @@ impl Game {
                     }
                     let p = &self.players[pi];
                     if husk.intersects(&p.body) && !p.field.readiness && !p.field.active {
-                        if self.damage_player(pi, HUSK_DAMAGE, &husk) {
+                        if self.damage_player(pi, HUSK_DAMAGE, &husk, Reach::ThroughDash) {
                             return true;
                         }
                     }
                 }
             }
 
-            if self.zombies[i].ay < gravity {
-                self.zombies[i].ay += v.hper(0.1);
-            }
-            let (zy, zay, zh) = (
-                self.zombies[i].body.y,
-                self.zombies[i].ay,
-                self.zombies[i].body.h,
-            );
-            if zy + zay + zh > ground {
-                self.zombies[i].body.y = ground - zh;
+            if let Movement::Fly { offset } = self.zombies[i].movement {
+                // Height is a wave rather than a fall. The same arc an ordinary
+                // flyer rides, and for the same reason: it has to dip low enough
+                // that a player standing on the ground can reach it, or a flying
+                // enemy would simply be unkillable without jumping.
+                let phase = (timer - offset) as f32 / 50.0;
+                self.zombies[i].ay = 0.0;
+                self.zombies[i].body.y = v.hper(FLYER_ARC_CENTER_PCT)
+                    + libm::sinf(phase) * v.hper(FLYER_ARC_SWING_PCT);
             } else {
-                self.zombies[i].body.y += zay;
+                if self.zombies[i].ay < gravity {
+                    self.zombies[i].ay += v.hper(0.1);
+                }
+                let (zy, zay, zh) = (
+                    self.zombies[i].body.y,
+                    self.zombies[i].ay,
+                    self.zombies[i].body.h,
+                );
+                if zy + zay + zh > ground {
+                    self.zombies[i].body.y = ground - zh;
+                } else {
+                    self.zombies[i].body.y += zay;
+                }
             }
 
             // A leaper's trajectory is its own; the chase would clamp the leap
             // speed down to walking pace and it would land short.
-            if matches!(self.zombies[i].behavior, Behavior::Leaper { .. }) {
+            if matches!(self.zombies[i].movement, Movement::Leap(_)) {
                 self.zombies[i].body.x += self.zombies[i].ax;
                 continue;
             }
@@ -1827,18 +2047,33 @@ impl Game {
                 max_ax *= ENRAGE_SPEED_MULTIPLIER;
             }
 
+            // Steering needs a foot on something. An enemy thrown into the air
+            // keeps the momentum it had rather than swimming after the player -
+            // except a flier, which is never on the ground and would otherwise
+            // never accelerate at all: it would hang in its arc where it spawned
+            // and simply bob.
             let on_ground =
                 (self.zombies[i].body.y - (ground - self.zombies[i].body.h)).abs() < 0.001;
+            let can_steer = on_ground || matches!(self.zombies[i].movement, Movement::Fly { .. });
+            // Over-speed bleeds off rather than being snapped away.
+            //
+            // It used to snap, and while nothing ever pushed an enemy *toward*
+            // the player that was invisible: knockback and blasts only ever
+            // throw outward, and those decelerate through the branches below.
+            // A wall that pulls does push inward, and a snap would have eaten
+            // the whole impulse on the tick it was given - the pull would move
+            // nothing at all while the push worked fine.
+            let accel = v.wper(CHASE_ACCEL_PCT);
             if target_x - self.zombies[i].body.x > 0.0 {
                 if self.zombies[i].ax > max_ax {
-                    self.zombies[i].ax = max_ax;
-                } else if on_ground {
-                    self.zombies[i].ax += v.wper(0.1);
+                    self.zombies[i].ax = (self.zombies[i].ax - accel).max(max_ax);
+                } else if can_steer {
+                    self.zombies[i].ax += accel;
                 }
             } else if self.zombies[i].ax < -max_ax {
-                self.zombies[i].ax = -max_ax;
-            } else if on_ground {
-                self.zombies[i].ax -= v.wper(0.1);
+                self.zombies[i].ax = (self.zombies[i].ax + accel).min(-max_ax);
+            } else if can_steer {
+                self.zombies[i].ax -= accel;
             }
 
             // No horizontal limit: the field is endless and a ground enemy has
@@ -1876,6 +2111,40 @@ impl Game {
     /// it is past the melee ceiling, so no amount of ramped reach turns one hit
     /// into two. The side is a coin flip: fleeing consistently away would let
     /// the player herd it.
+    /// Throws out one to [`BROOD_MAX`] young at the parent's feet.
+    ///
+    /// They are rolled the same way the parent was, so a brood is a handful of
+    /// unrelated shapes rather than copies - and rolled at ordinary strength,
+    /// because several eleven-swing enemies per blow is not a fight.
+    fn spawn_brood(&mut self, i: usize) {
+        let v = self.viewport;
+        // Held to the same ceiling the waves are. Without this a brooder is not
+        // a hard enemy, it is a losing race: every blow that fails to kill it
+        // leaves the player with more to do than before.
+        let room = max_concurrent_enemies(self.wave)
+            .saturating_sub(self.zombies.len() + self.flyers.len());
+        if room == 0 {
+            return;
+        }
+        let want = 1 + (self.elite_rng.unit() * BROOD_MAX as f32) as usize;
+        let (px, feet) = (
+            self.zombies[i].body.x,
+            self.zombies[i].body.y + self.zombies[i].body.h,
+        );
+        for _ in 0..want.min(room) {
+            // Young are drawn against the same wave: a brood must not be a
+            // way round the schedule its parent was held to.
+            let recipe = Recipe::roll(self.wave, &mut self.elite_rng);
+            let mut child = recipe.build_minion(&v, self.timer, &mut self.elite_rng);
+            // Put down beside the parent rather than at the field edge: young
+            // that had to walk back in would be a delay, not a consequence.
+            child.body.x = px + (self.elite_rng.unit() - 0.5) * v.wper(8.0);
+            child.body.y = feet - child.body.h;
+            child.ay = -v.hper(1.0);
+            self.zombies.push(child);
+        }
+    }
+
     fn shed_and_flee(&mut self, i: usize) {
         let v = self.viewport;
         let body = self.zombies[i].body;
@@ -1976,128 +2245,144 @@ impl Game {
         600
     }
 
+    /// Runs everything this enemy does beyond walking.
+    ///
+    /// Movement is one of a kind and behaviours are a set, so the first is a
+    /// match and the rest are passes. A leaping enemy can still shoot: only the
+    /// ways of moving are exclusive, and only because two of them would write
+    /// the same velocity on the same tick.
     fn tick_zombie_behavior(&mut self, i: usize) {
+        let ground = self.viewport.hper(GROUND_Y_PCT);
+        match self.zombies[i].movement {
+            Movement::Run | Movement::Fly { .. } => {}
+            Movement::Leap(_) => self.tick_leap(i, ground),
+            Movement::Hop { .. } => self.tick_hop(i, ground),
+        }
+        self.tick_shot(i);
+        // Blinking and shedding are answers to being hit, not things done on a
+        // tick; they live at the damage site.
+    }
+
+    fn tick_leap(&mut self, i: usize, ground: f32) {
         let v = self.viewport;
-        let ground = v.hper(GROUND_Y_PCT);
-        match self.zombies[i].behavior {
-            Behavior::None => {}
-            // Nothing per-tick: a blinker only reacts to being touched or hit.
-            Behavior::Blinker => {}
-            // Nor a shedder: between hits it walks like anything else, and the
-            // chase logic below is what does that.
-            Behavior::Shedder => {}
-            Behavior::Jumper { cooldown } => {
-                if cooldown > 0 {
-                    self.zombies[i].behavior = Behavior::Jumper {
-                        cooldown: cooldown - 1,
-                    };
-                } else if (self.zombies[i].body.y - (ground - self.zombies[i].body.h)).abs() < 0.001
-                {
-                    // Gravity and the ground clamp carry the rest of the arc.
-                    self.zombies[i].ay = -v.hper(JUMPER_JUMP_POWER_PCT);
-                    self.zombies[i].behavior = Behavior::Jumper {
-                        cooldown: JUMPER_JUMP_EVERY,
-                    };
-                }
-            }
-            Behavior::Leaper { crouch, airborne } => {
-                let z = &self.zombies[i];
-                let on_ground = (z.body.y - (ground - z.body.h)).abs() < 0.001;
+        let Movement::Leap(leap) = self.zombies[i].movement else {
+            return;
+        };
+        let z = &self.zombies[i];
+        let on_ground = (z.body.y - (ground - z.body.h)).abs() < 0.001;
 
-                if airborne {
-                    // The arc is committed; nothing steers it now.
-                    if on_ground {
-                        self.zombies[i].ax = 0.0;
-                        self.zombies[i].behavior = Behavior::Leaper {
-                            crouch: LEAPER_CROUCH_TICKS,
-                            airborne: false,
-                        };
-                    }
-                    return;
-                }
-                if !on_ground {
-                    return;
-                }
-
-                // Winding up: dead still, which is the tell.
+        if leap.airborne {
+            // The arc is committed; nothing steers it now.
+            if on_ground {
                 self.zombies[i].ax = 0.0;
-                if crouch > 0 {
-                    self.zombies[i].behavior = Behavior::Leaper {
-                        crouch: crouch - 1,
-                        airborne: false,
-                    };
-                    return;
-                }
-
-                let Some(target) = self.nearest_player(self.zombies[i].body.center_x()) else {
-                    return;
-                };
-                let reach = v.wper(LEAPER_MAX_REACH_PCT);
-                let dx = (self.players[target].body.center_x()
-                    - self.zombies[i].body.center_x())
-                .clamp(-reach, reach);
-
-                // Land exactly where the player is standing right now: the
-                // horizontal speed is the distance divided by the time the arc
-                // will take, so the two cannot disagree.
-                let ticks = Self::leap_flight_ticks(&v, LEAPER_JUMP_POWER_PCT);
-                self.zombies[i].ay = -v.hper(LEAPER_JUMP_POWER_PCT);
-                self.zombies[i].ax = dx / ticks as f32;
-                self.zombies[i].behavior = Behavior::Leaper {
-                    crouch: 0,
-                    airborne: true,
-                };
-            }
-            Behavior::Shooter { cooldown } => {
-                if cooldown > 0 {
-                    self.zombies[i].behavior = Behavior::Shooter {
-                        cooldown: cooldown - 1,
-                    };
-                    // Show the sight for the run-up to the shot. While it is
-                    // white it follows the player; once it goes red the aim is
-                    // locked and moving out of the line actually works.
-                    if cooldown <= SHOOTER_AIM_TICKS {
-                        let locked = cooldown <= SHOOTER_LOCK_TICKS;
-                        // Track while white. Locked with nothing to lock onto
-                        // can only happen to a shooter that came by its cooldown
-                        // some other way, but it should still have a sight.
-                        if !locked || self.zombies[i].aim.is_none() {
-                            self.zombies[i].aim = self.aim_at_nearest(i);
-                        }
-                        if let Some(aim) = self.zombies[i].aim {
-                            self.push_aim_dots(i, aim, locked);
-                        }
-                    }
-                    return;
-                }
-                let Some(target) = self.nearest_player(self.zombies[i].body.x) else {
-                    return;
-                };
-                self.zombies[i].behavior = Behavior::Shooter {
-                    cooldown: SHOOTER_FIRE_EVERY,
-                };
-                // Fire down the locked sight, not at wherever the player got to.
-                let from = self.zombies[i].body;
-                let aim = self.zombies[i].aim;
-                self.zombies[i].aim = None;
-                let (dx, dy) = match aim {
-                    Some((ax, ay)) => (ax - from.center_x(), ay - from.center_y()),
-                    None => {
-                        let to = self.players[target].body;
-                        (to.center_x() - from.center_x(), to.center_y() - from.center_y())
-                    }
-                };
-                let dist = libm::sqrtf(dx * dx + dy * dy).max(1.0);
-                let speed = v.wper(1.2);
-                self.projectiles.push(Projectile {
-                    body: Body::new(from.center_x(), from.center_y(), v.wper(1.5), v.hper(1.5)),
-                    ax: dx / dist * speed,
-                    ay: dy / dist * speed,
-                    damage: SHOOTER_PROJECTILE_DAMAGE,
-                    dead: false,
+                self.zombies[i].movement = Movement::Leap(Leap {
+                    crouch: LEAPER_CROUCH_TICKS,
+                    airborne: false,
                 });
             }
+            return;
         }
+        if !on_ground {
+            // Knocked into the air by something else; wait for the floor.
+            return;
+        }
+
+        // Winding up: dead still, which is the tell.
+        self.zombies[i].ax = 0.0;
+        if leap.crouch > 0 {
+            self.zombies[i].movement = Movement::Leap(Leap {
+                crouch: leap.crouch - 1,
+                airborne: false,
+            });
+            return;
+        }
+
+        let Some(target) = self.nearest_player(self.zombies[i].body.center_x()) else {
+            return;
+        };
+        let reach = v.wper(LEAPER_MAX_REACH_PCT);
+        let dx =
+            (self.players[target].body.center_x() - self.zombies[i].body.center_x())
+                .clamp(-reach, reach);
+
+        // Land exactly where the player is standing right now: the horizontal
+        // speed is the distance divided by the time the arc will take, so the
+        // two cannot disagree.
+        let ticks = Self::leap_flight_ticks(&v, LEAPER_JUMP_POWER_PCT);
+        self.zombies[i].ay = -v.hper(LEAPER_JUMP_POWER_PCT);
+        self.zombies[i].ax = dx / ticks as f32;
+        self.zombies[i].movement = Movement::Leap(Leap {
+            crouch: 0,
+            airborne: true,
+        });
+    }
+
+    fn tick_hop(&mut self, i: usize, ground: f32) {
+        let v = self.viewport;
+        let Movement::Hop { cooldown } = self.zombies[i].movement else {
+            return;
+        };
+        if cooldown > 0 {
+            self.zombies[i].movement = Movement::Hop {
+                cooldown: cooldown - 1,
+            };
+        } else if (self.zombies[i].body.y - (ground - self.zombies[i].body.h)).abs() < 0.001 {
+            // Gravity and the ground clamp carry the rest of the arc.
+            self.zombies[i].ay = -v.hper(JUMPER_JUMP_POWER_PCT);
+            self.zombies[i].movement = Movement::Hop {
+                cooldown: JUMPER_JUMP_EVERY,
+            };
+        }
+    }
+
+    fn tick_shot(&mut self, i: usize) {
+        let v = self.viewport;
+        let Some(cooldown) = self.zombies[i].behaviors.shoot else {
+            return;
+        };
+        if cooldown > 0 {
+            self.zombies[i].behaviors.shoot = Some(cooldown - 1);
+            // Show the sight for the run-up to the shot. While it is white it
+            // follows the player; once it goes red the aim is locked and moving
+            // out of the line actually works.
+            if cooldown <= SHOOTER_AIM_TICKS {
+                let locked = cooldown <= SHOOTER_LOCK_TICKS;
+                // Track while white. Locked with nothing to lock onto can only
+                // happen to a shooter that came by its cooldown some other way,
+                // but it should still have a sight.
+                if !locked || self.zombies[i].aim.is_none() {
+                    self.zombies[i].aim = self.aim_at_nearest(i);
+                }
+                if let Some(aim) = self.zombies[i].aim {
+                    self.push_aim_dots(i, aim, locked);
+                }
+            }
+            return;
+        }
+        let Some(target) = self.nearest_player(self.zombies[i].body.x) else {
+            return;
+        };
+        self.zombies[i].behaviors.shoot = Some(SHOOTER_FIRE_EVERY);
+        // Fire down the locked sight, not at wherever the player got to.
+        let from = self.zombies[i].body;
+        let aim = self.zombies[i].aim;
+        self.zombies[i].aim = None;
+        let (dx, dy) = match aim {
+            Some((ax, ay)) => (ax - from.center_x(), ay - from.center_y()),
+            None => {
+                let to = self.players[target].body;
+                (to.center_x() - from.center_x(), to.center_y() - from.center_y())
+            }
+        };
+        let dist = libm::sqrtf(dx * dx + dy * dy).max(1.0);
+        let speed = v.wper(1.2);
+        self.projectiles.push(Projectile {
+            body: Body::new(from.center_x(), from.center_y(), v.wper(1.5), v.hper(1.5)),
+            ax: dx / dist * speed,
+            ay: dy / dist * speed,
+            damage: SHOOTER_PROJECTILE_DAMAGE,
+            dead: false,
+        });
     }
 
     /* ---------------- flyers ---------------- */
@@ -2137,10 +2422,19 @@ impl Game {
                 // instant kill here whatever the health, which meant one charge
                 // ended the flying boss while forty walls could not have ended
                 // a ground one.
-                if by_field && self.flyers[i].is_boss {
-                    self.flyers[i].hp -= self.flyers[i].hpmax * FIELD_BOSS_FRACTION;
+                if by_field {
+                    // Once per wall, as on the ground.
+                    let wall = self.players[attacker].strike_id;
+                    if self.flyers[i].last_strike != wall {
+                        self.flyers[i].last_strike = wall;
+                        if self.flyers[i].is_boss {
+                            self.flyers[i].hp -= self.flyers[i].hpmax * FIELD_BOSS_FRACTION;
+                        } else {
+                            self.flyers[i].hp -= FIELD_DAMAGE;
+                        }
+                    }
                 }
-                if self.flyers[i].hp < 0.0 || (by_field && !self.flyers[i].is_boss) {
+                if self.flyers[i].hp < 0.0 {
                     let (gain, text) = if self.flyers[i].is_boss {
                         let reward = 100 * self.wave;
                         (reward, format!("+{}", reward))
@@ -2248,7 +2542,7 @@ impl Game {
                         continue;
                     }
                     let source = self.flyers[i].body;
-                    let ended = self.damage_player(pi, 16.0, &source);
+                    let ended = self.damage_player(pi, 16.0, &source, Reach::Normal);
                     self.players[pi].ay = -v.hper(2.0);
                     if ended {
                         return true;
@@ -2263,6 +2557,16 @@ impl Game {
             // When the player outruns one it ends up pressed against the
             // trailing edge and is carried along, which reads as pursuit; when
             // the player stands still it goes back to patrolling the screen.
+            // Nothing else in a flyer's update ever lowers its speed: `ax` is
+            // written on spawn, on being hit and on a blast, and the edges only
+            // flip its sign. Without this a shove would not be a shove - it
+            // would be the speed the flyer keeps for the rest of its life.
+            let cruise = v.wper(FLYER_CRUISE_PCT);
+            if self.flyers[i].ax.abs() > cruise {
+                let sign = if self.flyers[i].ax > 0.0 { 1.0 } else { -1.0 };
+                self.flyers[i].ax =
+                    sign * (self.flyers[i].ax.abs() - v.wper(CHASE_ACCEL_PCT)).max(cruise);
+            }
             self.flyers[i].body.x += self.flyers[i].ax;
             let (left, right) = (self.camera_x, self.camera_x + v.w - self.flyers[i].body.w);
             if self.flyers[i].body.x < left {
@@ -2333,7 +2637,7 @@ impl Game {
                         let source = self.projectiles[i].body;
                         let amount = self.projectiles[i].damage;
                         self.projectiles[i].dead = true;
-                        if self.damage_player(pi, amount, &source) {
+                        if self.damage_player(pi, amount, &source, Reach::Normal) {
                             return true;
                         }
                         break;

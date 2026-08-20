@@ -1,0 +1,166 @@
+{
+  "schema": 1,
+  "name": "pack3",
+  "description": "Third chiptune set: same roles and loop shape as pack1, different composition",
+  "music": {
+    "sample_rate": 44100,
+    "loop_samples": 991232,
+    "bpm": 85.4215,
+    "bars": 8,
+    "baked_gain_db": 4.5,
+    "layers": [
+      {
+        "id": "all_time",
+        "mode": "always",
+        "file": "all_time"
+      },
+      {
+        "id": "leisure",
+        "mode": "situation",
+        "group": "base",
+        "when": [
+          "calm",
+          "paused"
+        ],
+        "fade_in_ms": 700,
+        "fade_out_ms": 700,
+        "file": "leisure"
+      },
+      {
+        "id": "fight",
+        "mode": "situation",
+        "group": "base",
+        "when": [
+          "combat"
+        ],
+        "fade_in_ms": 700,
+        "fade_out_ms": 700,
+        "file": "fight"
+      },
+      {
+        "id": "zombie",
+        "mode": "count",
+        "count_of": "zombie",
+        "steps_db": [
+          [
+            1,
+            -12
+          ],
+          [
+            2,
+            -6
+          ],
+          [
+            3,
+            0
+          ]
+        ],
+        "mute_when": [
+          "paused"
+        ],
+        "fade_in_ms": 250,
+        "fade_out_ms": 900,
+        "hold_ms": 700,
+        "file": "zombie"
+      },
+      {
+        "id": "garp",
+        "mode": "count",
+        "count_of": "flyer",
+        "steps_db": [
+          [
+            1,
+            -12
+          ],
+          [
+            2,
+            -6
+          ],
+          [
+            3,
+            0
+          ]
+        ],
+        "mute_when": [
+          "paused"
+        ],
+        "fade_in_ms": 250,
+        "fade_out_ms": 900,
+        "hold_ms": 700,
+        "file": "garp"
+      },
+      {
+        "id": "boss",
+        "mode": "flag",
+        "flag": "boss",
+        "mute_when": [
+          "paused"
+        ],
+        "fade_in_ms": 120,
+        "fade_out_ms": 1500,
+        "file": "boss"
+      }
+    ]
+  },
+  "sfx": {
+    "baked_gain_db": 13.11,
+    "mute_when": [
+      "paused"
+    ],
+    "sounds": [
+      {
+        "id": "hit",
+        "max_voices": 4,
+        "min_interval_ms": 40,
+        "file": "hit"
+      },
+      {
+        "id": "jump",
+        "max_voices": 2,
+        "min_interval_ms": 60,
+        "file": "jump"
+      },
+      {
+        "id": "down",
+        "max_voices": 3,
+        "min_interval_ms": 60,
+        "file": "down"
+      }
+    ]
+  },
+  "encodings": {
+    "desktop": {
+      "dir": "desktop",
+      "format": "flac",
+      "channels": 2,
+      "gains_db": {
+        "all_time": 0.0,
+        "leisure": 0.0,
+        "fight": 0.0,
+        "zombie": 0.0,
+        "garp": 0.0,
+        "boss": 0.0,
+        "hit": 0.0,
+        "jump": 0.0,
+        "down": 0.0
+      }
+    },
+    "psp": {
+      "dir": "psp",
+      "format": "pcm_u8",
+      "channels": 1,
+      "//": "each file is peak-normalised; apply gains_db when mixing",
+      "gains_db": {
+        "all_time": -17.04,
+        "leisure": -31.26,
+        "fight": -12.37,
+        "zombie": -5.3,
+        "garp": -24.13,
+        "boss": -12.43,
+        "hit": -15.36,
+        "jump": -7.82,
+        "down": -12.52
+      }
+    }
+  }
+}

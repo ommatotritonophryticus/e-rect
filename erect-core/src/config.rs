@@ -170,6 +170,15 @@ pub const GUN_EXTRA_MAX_PCT: f32 = 25.0;
 /// aiming meaningless.
 pub const GUN_MAX_REACH_PCT: f32 = 60.0;
 
+/// What one wall takes off anything that is not a boss.
+///
+/// Flat, and just past the 255 every ordinary enemy carries, so the wall still
+/// clears a crowd in one touch exactly as it always did. What it stops doing is
+/// deleting things by fiat: it used to set health to -1 regardless, which meant
+/// a heavy enemy with twice the health of an armoured one died to a single
+/// charge, and there was no way to build one that did not.
+pub const FIELD_DAMAGE: f32 = 300.0;
+
 /// What one wall takes off a boss, as a fraction of its full health.
 ///
 /// A flat 255 was an instant kill on anything ordinary and two percent of a
@@ -306,6 +315,10 @@ pub const COMBO_WINDOW_TICKS: i64 = 60;
 /// Popup lifetime in ticks.
 pub const POPUP_LIFETIME: i64 = 30;
 
+/// How long a rolled heavy's name stays up. Long enough to read four words
+/// while something is walking towards you.
+pub const ELITE_NOTICE_TICKS: i64 = 150;
+
 /* ---------------- how many at once ---------------- */
 
 /// Concurrent enemies allowed on screen for the first ten waves.
@@ -317,6 +330,46 @@ pub const MAX_CONCURRENT_ENEMIES: usize = 10;
 /// wave 2 to wave 9 - so the thing that changes there is *what* turns up. Once
 /// the player has met everything, the lever left is how much of it is on screen
 /// at once, and that is what this ramp is.
+/// First wave that brings a rolled heavy.
+///
+/// Late enough that the fixed roster has all been met and can be recognised on
+/// sight - a rolled enemy only reads as unusual against a known set. Boss waves
+/// are left alone: they already have a headline.
+pub const ELITE_FIRST_WAVE: i64 = 6;
+
+/// Fraction of a wave's spawn budget that must be spent before its heavy walks
+/// in. The wave opens as an ordinary one and then turns, rather than starting
+/// with the hardest thing in it standing alone on an empty field.
+pub const ELITE_ENTRY_FRACTION: i64 = 4;
+
+/// The speed a modified wall hands every enemy on the field, as a percentage of
+/// the view per tick.
+///
+/// Written straight into the enemy's own velocity, so this is an impulse and
+/// not a distance. The chase bleeds it off at [`CHASE_ACCEL_PCT`] a tick: a
+/// tenth of the view over the first [`WALL_SHOVE_TICKS`], and about a quarter
+/// by the time the enemy is walking again some twenty ticks later. There is no
+/// moment it stops - it coasts, the way everything else thrown in this game
+/// does.
+///
+/// A tenth of the view is roughly two body widths - enough to open a gap or to
+/// gather a spread-out wave into one place, and not enough to be a kill on its
+/// own.
+pub const WALL_SHOVE_AX_PCT: f32 = 2.3;
+/// The window the shove is aimed at, and what the tests measure over.
+pub const WALL_SHOVE_TICKS: i32 = 5;
+
+/// How fast an enemy gains or loses ground speed, per tick.
+///
+/// Also the rate anything faster than it should be going bleeds back down -
+/// which is what turns a written-in velocity into a shove rather than a new
+/// permanent speed.
+pub const CHASE_ACCEL_PCT: f32 = 0.1;
+
+/// A flyer's cruising speed. Anything above it was done to the flyer and
+/// decays; nothing else in its update would ever bring it back down.
+pub const FLYER_CRUISE_PCT: f32 = 0.5;
+
 pub const CROWD_RAMP_FIRST_WAVE: i64 = 11;
 
 /// Waves per extra enemy on screen.

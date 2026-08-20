@@ -7,6 +7,7 @@
 //! did not go looking for it.
 
 use crate::attack::{AttackKind, MAX_LEVEL};
+use crate::boon::{Boons, WallMod};
 use crate::waves::{WaveKind, WaveRule};
 
 /// Score moves in steps this size. A run worth of score is thousands of points,
@@ -38,6 +39,9 @@ const RULES: [Option<WaveRule>; 6] = [
 
 /// Every attack the menu can hand out, with the one the game starts on first.
 /// `AttackKind::ALL` is the upgrade roster and deliberately excludes it.
+/// Every wall the menu can hand out, plain first.
+const WALLS: [WallMod; 3] = [WallMod::Plain, WallMod::Pull, WallMod::Push];
+
 const ATTACKS: [AttackKind; 9] = [
     AttackKind::Basic,
     AttackKind::Hammer,
@@ -60,6 +64,10 @@ pub struct DevSetup {
     pub players: usize,
     pub attack: AttackKind,
     pub attack_level: u8,
+    /// Standing upgrades to start the run holding. The offer normally hands
+    /// these out one at a time over tens of thousands of points, which is the
+    /// whole reason to be able to set them here.
+    pub boons: Boons,
 }
 
 impl Default for DevSetup {
@@ -72,6 +80,7 @@ impl Default for DevSetup {
             players: 1,
             attack: AttackKind::Basic,
             attack_level: 1,
+            boons: Boons::default(),
         }
     }
 }
@@ -103,6 +112,55 @@ impl DevSetup {
     pub fn adjust_attack_level(&mut self, dir: i32) {
         let level = (self.attack_level as i32 + dir).clamp(1, MAX_LEVEL as i32);
         self.attack_level = level as u8;
+    }
+
+    pub fn toggle_double_jump(&mut self) {
+        self.boons.double_jump = !self.boons.double_jump;
+    }
+
+    pub fn toggle_dash_free(&mut self) {
+        self.boons.dash_free = !self.boons.dash_free;
+    }
+
+    pub fn toggle_shield(&mut self) {
+        self.boons.shield = !self.boons.shield;
+    }
+
+    pub fn cycle_wall(&mut self, dir: i32) {
+        let at = WALLS.iter().position(|w| *w == self.boons.wall).unwrap_or(0);
+        self.boons.wall = WALLS[step(at, dir, WALLS.len())];
+    }
+
+    /// True when the run would start holding everything there is.
+    pub fn all_boons(&self) -> bool {
+        self.boons.double_jump
+            && self.boons.dash_free
+            && self.boons.shield
+            && self.boons.wall != WallMod::Plain
+    }
+
+    /// Every boon at once, or none. What "set all the upgrades" means when it
+    /// is one press: the wall goes to the first modified one rather than back
+    /// to plain, because plain is what "off" already looks like.
+    pub fn toggle_all_boons(&mut self) {
+        self.boons = if self.all_boons() {
+            Boons::default()
+        } else {
+            Boons {
+                double_jump: true,
+                dash_free: true,
+                shield: true,
+                wall: WallMod::Pull,
+            }
+        };
+    }
+
+    pub fn wall_label(&self) -> &'static str {
+        match self.boons.wall {
+            WallMod::Plain => "PLAIN",
+            WallMod::Pull => "BLACK",
+            WallMod::Push => "GREY",
+        }
     }
 
     pub fn cycle_kind(&mut self, dir: i32) {

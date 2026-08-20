@@ -141,7 +141,7 @@ unsafe fn render_settings(game: &Game) {
 unsafe fn render_dev_menu(game: &Game) {
     unsafe {
         let v = &game.viewport;
-        centered("DEV", 14.0, v.hper(9.0), WHITE, game);
+        centered("DEV", 11.0, v.hper(6.0), WHITE, game);
         render_menu(game, &game.dev_menu);
         centered("LEFT/RIGHT CHANGE   O BACK", 92.0, v.hper(4.5), GREY, game);
     }
@@ -202,6 +202,12 @@ unsafe fn render_session(game: &Game) {
         let ow = v.wper(0.4);
         let oh = v.hper(0.4);
 
+        // See the desktop renderer: the one thing on the field that cannot be
+        // read off its colour gets named when it walks in.
+        if let Some(name) = game.elite_notice() {
+            centered(name, 16.0, v.hper(5.0), WHITE, game);
+        }
+
         if game.waves.countdown >= 0 {
             let text = format!("{}", game.waves.countdown);
             centered(&text, 36.0, v.hper(13.0), WHITE, game);
@@ -215,6 +221,26 @@ unsafe fn render_session(game: &Game) {
 
         for p in game.players.iter().filter(|p| !p.dead) {
             let body = on_screen(&p.body, cam);
+            // See the desktop renderer: a white ring with a black gap, so it
+            // still reads on a player who picked white.
+            if p.shield_up(game.timer) {
+                let halo = v.wper(0.9);
+                let gap = v.wper(0.25);
+                gfx::rect(
+                    body.x - halo,
+                    body.y - halo,
+                    body.w + halo * 2.0,
+                    body.h + halo * 2.0,
+                    WHITE,
+                );
+                gfx::rect(
+                    body.x - gap,
+                    body.y - gap,
+                    body.w + gap * 2.0,
+                    body.h + gap * 2.0,
+                    BLACK,
+                );
+            }
             actor(&body, gfx::pack(p.color.shaded(p.hp / 255.0)), ow, oh);
             // Thrown squares and placed boxes, in the player's own colour so
             // it is obvious in co-op whose they are.
@@ -245,11 +271,7 @@ unsafe fn render_session(game: &Game) {
             for choice in offer.choices.iter() {
                 let body = on_screen(&choice.body, cam);
                 actor(&body, face, ow, oh);
-                let label = if choice.is_upgrade(game.players[0].attack) {
-                    format!("{} {}", choice.kind.label(), choice.level)
-                } else {
-                    alloc::string::String::from(choice.kind.label())
-                };
+                let label = choice.label(game.players[0].attack);
                 let x = body.x + body.w / 2.0 - crate::font::text_width(&label, size) / 2.0;
                 gfx::text_shadowed(x, body.y - v.hper(2.0), size, face, &label);
             }
@@ -278,8 +300,9 @@ unsafe fn render_session(game: &Game) {
         if libm::sinf(game.timer as f32) < 0.0 {
             for p in game.players.iter().filter(|p| p.field.active) {
                 let b = on_screen(&p.field.body, cam);
-                gfx::rect(b.x - ow, b.y - oh, b.w + ow * 2.0, b.h + oh * 2.0, BLACK);
-                gfx::rect(b.x, b.y, b.w, b.h, WHITE);
+                // See the desktop renderer: bare slab, the colour is the whole
+                // of the warning.
+                gfx::rect(b.x, b.y, b.w, b.h, gfx::pack(p.boons.wall.color()));
             }
             for e in game.explosions.iter().filter(|e| !e.finished) {
                 let b = on_screen(&e.body, cam);

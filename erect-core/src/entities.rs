@@ -2,13 +2,18 @@
 //!
 //! The JS attached per-variant behaviour as an `onTick` closure on each enemy.
 //! Closures that mutate the whole world do not translate to Rust ownership, so
-//! behaviour is an enum the simulation matches on instead - same effect, and it
-//! keeps every enemy a plain value that can live in a `Vec`.
+//! behaviour is data the simulation reads instead - same effect, and it keeps
+//! every enemy a plain value that can live in a `Vec`.
+//!
+//! That data is a *set*, not a choice: an enemy may hop and shoot and shed all
+//! at once. Every named variant below is a preset over the same fields, which
+//! is why they cost nothing to keep alongside enemies built by rolling dice.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::attack::{AttackKind, HeightAnchor};
+use crate::boon::Boons;
 use crate::color::Rgb;
 use crate::config::*;
 use crate::geom::{Body, Viewport};
@@ -16,6 +21,24 @@ use crate::geom::{Body, Viewport};
 /* ------------------------------------------------------------------ *
  * Player
  * ------------------------------------------------------------------ */
+
+/// What a hit is allowed to reach through.
+///
+/// One thing in the game is allowed past a dash, and it is worth a type rather
+/// than a bare flag at the call site: a `true` there says nothing about which
+/// way round the rule runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// Stopped by every protection there is.
+    Normal,
+    /// Reaches a dashing player anyway - a raised wall still stops it.
+    ///
+    /// The shedder's husk, and only that. It takes no damage and it does not
+    /// move, which makes it the one answer to using the dash as a crowd-clear;
+    /// if a dash made it harmless too, there would be nothing on the field a
+    /// dash could not simply drive through.
+    ThroughDash,
+}
 
 pub struct Player {
     pub index: usize,
@@ -52,6 +75,16 @@ pub struct Player {
     /// that has already done some of its work, and a counter set there would be
     /// decremented by that same tick and come up one frame short.
     pub dash_grace_until: i64,
+
+    /// Standing upgrades this run has picked up.
+    pub boons: Boons,
+    /// Jumps left before the next landing. Only ever above zero with
+    /// [`Boon::DoubleJump`], and spent by jumping off nothing.
+    pub air_jumps: u8,
+    /// First tick the shield can absorb again. A deadline rather than a
+    /// counter, so it survives the clock going back to zero at the start of a
+    /// run - a "last used at" would read as freshly spent there.
+    pub shield_ready_at: i64,
 
     pub grounded: bool,
     pub facing_right: bool,
@@ -96,6 +129,9 @@ impl Player {
             dash_dir: 1.0,
             dash_cooldown: 0,
             dash_grace_until: -1,
+            boons: Boons::default(),
+            air_jumps: 0,
+            shield_ready_at: 0,
             grounded: false,
             facing_right: true,
             attack_ticks: 0,
@@ -138,6 +174,12 @@ impl Player {
         self.gun_back = None;
         self.attack = AttackKind::Basic;
         self.attack_level = 1;
+        // Boons belong to a run, exactly as the weapon does. `revive` is the
+        // one that must not touch them: dying between waves costs health and
+        // position, never what the run has earned.
+        self.boons = Boons::default();
+        self.air_jumps = 0;
+        self.shield_ready_at = 0;
         self.field = UltimateField::default();
     }
 
@@ -164,6 +206,24 @@ impl Player {
 
     pub fn dashing(&self) -> bool {
         self.dash_ticks > 0
+    }
+
+    /// Every state that means "this cannot hurt me", in one place.
+    ///
+    /// Three of these used to be checked only where an enemy *body* touched the
+    /// player. That left the two sources which do not go through those sites -
+    /// a shot and a shedder's hazard - reaching straight through a raised wall
+    /// and through a dash.
+    pub fn untouchable(&self, timer: i64, reach: Reach) -> bool {
+        if self.invulnerable || self.field.readiness || self.field.active {
+            return true;
+        }
+        reach == Reach::Normal && self.in_dash_window(timer)
+    }
+
+    /// True while a shield is held and ready to take the next touch.
+    pub fn shield_up(&self, timer: i64) -> bool {
+        self.boons.shield && timer >= self.shield_ready_at
     }
 
     /// While this holds, the dash shoves what it touches instead of trading
@@ -419,34 +479,61 @@ impl UltimateField {
 /// a second entry in an already crowded palette.
 pub const SHEDDER_COLOR: Rgb = Rgb::new(90.0, 200.0, 90.0);
 
-/// Per-variant behaviour, replacing the JS `onTick` closures.
+/// A leap in progress: the wind-up, then the committed arc.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Behavior {
-    None,
-    /// Leaps toward the player periodically while grounded.
-    Jumper {
-        cooldown: i32,
-    },
-    /// Fires a projectile at whoever it is chasing.
-    Shooter {
-        cooldown: i32,
-    },
-    /// Leaves a blast and jumps back to the edge on contact, and once on damage.
-    Blinker,
-    /// Stands still, then leaps at wherever the player was when it launched.
-    /// Its arc is computed so it comes down exactly on that spot.
-    Leaper {
-        crouch: i32,
-        /// While true the trajectory is locked and the chase logic leaves it be.
-        airborne: bool,
-    },
-    /// Walks like anything else until it is hurt, then leaves a husk standing
-    /// where it was hit and reappears out of melee range.
-    ///
-    /// Unlike a blinker this happens on *every* hit, not once - the exchange is
-    /// meant to be a trade rather than an opening. The player gets the damage
-    /// in and gets a hazard to work around for it.
-    Shedder,
+pub struct Leap {
+    /// Ticks left standing dead still. That stillness is the tell.
+    pub crouch: i32,
+    /// While true the trajectory is locked and nothing steers it.
+    pub airborne: bool,
+}
+
+/// How an enemy gets about. Exactly one of these, always.
+///
+/// Movement is a choice where behaviour is a set, and the difference is not
+/// arbitrary: two ways of moving would both write the same velocity on the same
+/// tick and one would silently win. Making it an enum says that in the type
+/// instead of guarding for it at runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Movement {
+    /// Walks at whoever is nearest. What every enemy did before there was a
+    /// choice.
+    #[default]
+    Run,
+    /// Walks, and hops on a timer.
+    Hop { cooldown: i32 },
+    /// Stands still, then throws itself at where the player was.
+    Leap(Leap),
+    /// Rides the same sine an ordinary flyer does, gravity ignored. `offset`
+    /// fixes where in that wave it starts.
+    Fly { offset: i64 },
+}
+
+/// What an enemy does beyond walking at whoever is nearest.
+///
+/// A set rather than a choice. It used to be an enum, which made every enemy
+/// exactly one thing - and the roster paid for it: ten variants, of which seven
+/// differ only in which single behaviour they carry, because size, speed and
+/// armour could be combined and behaviour could not.
+///
+/// Each entry carries its own state, so two of them running at once do not
+/// share a counter and cannot tread on each other. How the enemy *moves* is a
+/// separate axis - see [`Movement`] - because those genuinely are exclusive.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Behaviors {
+    /// Ticks until the next shot.
+    pub shoot: Option<i32>,
+    /// Leaves a blast and jumps to the edge on contact, and once on damage.
+    pub blink: bool,
+    /// Blinks out of reach on every hit it survives, leaving a hazard behind.
+    pub shed: bool,
+}
+
+impl Behaviors {
+    /// Nothing but the walk every enemy has.
+    pub fn plain() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -459,11 +546,21 @@ pub struct Zombie {
     pub color: Rgb,
 
     pub is_boss: bool,
+    /// Built by rolling rather than picked off the roster. Drives nothing in
+    /// the simulation - it is what tells a renderer to mark it, since a rolled
+    /// enemy has no signature colour to be recognised by.
+    pub elite: bool,
+    /// Answers every blow it survives with young. Never set on the young.
+    pub broods: bool,
+    /// What killing it pays. Carried rather than derived, so how tough a thing
+    /// is and what it is worth can be set apart from each other.
+    pub reward: i64,
     pub armor: f32,
     pub splits_into: u32,
     pub speed_multiplier: f32,
     pub enrages: bool,
-    pub behavior: Behavior,
+    pub movement: Movement,
+    pub behaviors: Behaviors,
     /// Set by the first hit this one takes; a blinker uses it to leave exactly
     /// once for damage, however many hits follow.
     pub hurt_once: bool,
@@ -507,11 +604,15 @@ impl Zombie {
             hpmax: 255.0,
             color,
             is_boss: false,
+            elite: false,
+            broods: false,
+            reward: 6,
             armor: 1.0,
             splits_into: 0,
             speed_multiplier: 1.0,
             enrages: false,
-            behavior: Behavior::None,
+            movement: Movement::default(),
+            behaviors: Behaviors::default(),
             hurt_once: false,
             last_strike: 0,
             aim: None,
@@ -580,17 +681,17 @@ impl Zombie {
     /// Winds up on the spot, then throws itself at the player.
     pub fn leaper(v: &Viewport, rng: &mut Rng) -> Self {
         let mut z = Self::from_edge(v, rng, Rgb::new(255.0, 90.0, 200.0));
-        z.behavior = Behavior::Leaper {
+        z.movement = Movement::Leap(Leap {
             crouch: LEAPER_CROUCH_TICKS,
             airborne: false,
-        };
+        });
         z
     }
 
     pub fn jumper(v: &Viewport, rng: &mut Rng) -> Self {
         let mut z = Self::from_edge(v, rng, Rgb::new(255.0, 140.0, 0.0));
         // staggered so a group of jumpers does not move in lockstep
-        z.behavior = Behavior::Jumper {
+        z.movement = Movement::Hop {
             cooldown: rng.range(0, JUMPER_JUMP_EVERY),
         };
         z
@@ -618,7 +719,7 @@ impl Zombie {
     /// it, and it leaves a blast behind and reappears at the edge of the field.
     pub fn blinker(v: &Viewport, rng: &mut Rng) -> Self {
         let mut z = Self::from_edge(v, rng, Rgb::new(220.0, 40.0, 40.0));
-        z.behavior = Behavior::Blinker;
+        z.behaviors.blink = true;
         z
     }
 
@@ -626,7 +727,7 @@ impl Zombie {
     /// husk standing where the hit landed.
     pub fn shedder(v: &Viewport, rng: &mut Rng) -> Self {
         let mut z = Self::from_edge(v, rng, SHEDDER_COLOR);
-        z.behavior = Behavior::Shedder;
+        z.behaviors.shed = true;
         z.max_husks = SHEDDER_HUSKS;
         z
     }
@@ -635,16 +736,14 @@ impl Zombie {
     /// first boss's health rather than its own wave's.
     pub fn shedder_boss(v: &Viewport, rng: &mut Rng) -> Self {
         let mut z = Self::boss(v, SHEDDER_BOSS_HEALTH_WAVE, rng);
-        z.behavior = Behavior::Shedder;
+        z.behaviors.shed = true;
         z.max_husks = SHEDDER_BOSS_HUSKS;
         z
     }
 
     pub fn shooter(v: &Viewport, rng: &mut Rng) -> Self {
         let mut z = Self::from_edge(v, rng, Rgb::new(60.0, 200.0, 220.0));
-        z.behavior = Behavior::Shooter {
-            cooldown: rng.range(0, SHOOTER_FIRE_EVERY),
-        };
+        z.behaviors.shoot = Some(rng.range(0, SHOOTER_FIRE_EVERY));
         z
     }
 }

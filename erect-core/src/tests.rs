@@ -4,8 +4,12 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use alloc::string::{String, ToString};
 use crate::attack::{AttackKind, MAX_LEVEL};
-use crate::offer::{OFFER_ARM_TICKS, OFFER_SCORE_STEP};
+use crate::recipe::{unlock, MoveKind, Recipe, Size, BROOD_MAX, ELITE_COLOR, ELITE_HP};
+use crate::boon::{Boon, Boons, WallMod, SHIELD_COOLDOWN_TICKS};
+use crate::entities::Reach;
+use crate::offer::{Offer, OfferItem, OFFER_ARM_TICKS, OFFER_SCORE_STEP};
 use crate::config::*;
 use crate::dev::{DevSetup, DEV_MAX_SCORE, DEV_MAX_WAVE, DEV_SCORE_STEP};
 use crate::entities::*;
@@ -347,7 +351,7 @@ fn shooter_fires_a_projectile_that_hurts_a_player() {
     let mut game = new_game();
     game.start_run(1);
     let mut shooter = Zombie::shooter(&game.viewport, &mut game.rng);
-    shooter.behavior = Behavior::Shooter { cooldown: 0 };
+    shooter.behaviors.shoot = Some(0);
     shooter.body.x = 0.0;
     shooter.body.y = game.viewport.hper(75.0);
     game.zombies.push(shooter);
@@ -407,7 +411,7 @@ fn jumper_leaves_the_ground() {
     game.start_run(1);
     let ground = game.viewport.hper(GROUND_Y_PCT);
     let mut jumper = Zombie::jumper(&game.viewport, &mut game.rng);
-    jumper.behavior = Behavior::Jumper { cooldown: 0 };
+    jumper.movement = Movement::Hop { cooldown: 0 };
     jumper.body.y = ground - jumper.body.h;
     let resting_y = jumper.body.y;
     game.zombies.push(jumper);
@@ -1879,7 +1883,7 @@ fn a_shooter_shows_a_sight_that_locks_before_it_fires() {
     z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
     z.hp = 9999.0;
     z.hpmax = 9999.0;
-    z.behavior = Behavior::Shooter { cooldown: SHOOTER_AIM_TICKS + 4 };
+    z.behaviors.shoot = Some(SHOOTER_AIM_TICKS + 4);
     game.zombies.push(z);
 
     let mut saw_white = false;
@@ -1928,7 +1932,7 @@ fn a_locked_sight_does_not_follow_the_player() {
     z.hp = 9999.0;
     z.hpmax = 9999.0;
     // Come into the lock the way a real shooter does: aiming first.
-    z.behavior = Behavior::Shooter { cooldown: SHOOTER_AIM_TICKS };
+    z.behaviors.shoot = Some(SHOOTER_AIM_TICKS);
     game.zombies.push(z);
 
     for _ in 0..(SHOOTER_AIM_TICKS - SHOOTER_LOCK_TICKS) {
@@ -2605,7 +2609,7 @@ fn the_wave_manager_honours_the_growing_crowd() {
     let mut game = new_game();
     let held = MAX_CONCURRENT_ENEMIES;
 
-    let mut spawned_at = |wave: i64, live: usize, game: &mut Game| {
+    let spawned_at = |wave: i64, live: usize, game: &mut Game| {
         let mut manager = WaveManager::default();
         manager.skip_countdown();
         manager.kind = WaveKind::GroundOnly;
@@ -2631,12 +2635,660 @@ fn the_wave_manager_honours_the_growing_crowd() {
     );
 }
 
+/* ---------------- rolled enemies ---------------- */
+
+#[test]
+fn a_rolled_enemy_carries_the_health_it_was_promised() {
+    // Twice what an armoured one takes: 510 against a quarter armour is 32
+    // connecting ticks, about eleven swings.
+    let mut game = new_game();
+    let v = game.viewport;
+    let r = Recipe {
+        movement: MoveKind::Run,
+        size: Size::Normal,
+        shoot: false,
+        blink: false,
+        shed: false,
+        brood: false,
+    };
+    let z = r.build(&v, 6, 0, &mut game.rng);
+    assert_eq!(z.hpmax, ELITE_HP);
+    assert_eq!(z.armor, ARMORED_ARMOR);
+    let ticks = (z.hpmax / (64.0 * z.armor)).ceil();
+    assert_eq!(ticks, 32.0, "it should take 32 connecting ticks");
+    assert!(z.elite, "and be marked, having no signature colour of its own");
+    assert!(!z.is_boss, "but not be a boss: that flag decides other things");
+}
+
+#[test]
+fn size_is_independent_of_how_it_moves() {
+    // The whole point of the axes: a flier can be the size of a boss and a
+    // runner the size of a flyer.
+    let mut game = new_game();
+    let v = game.viewport;
+    let build = |size: Size, movement: MoveKind, g: &mut Game| {
+        Recipe { movement, size, shoot: false, blink: false, shed: false, brood: false }
+            .build(&v, 6, 0, &mut g.rng)
+    };
+
+    let huge_flier = build(Size::Large, MoveKind::Fly, &mut game);
+    let slight_runner = build(Size::Flyer, MoveKind::Run, &mut game);
+
+    assert!(matches!(huge_flier.movement, Movement::Fly { .. }));
+    assert!(huge_flier.body.w > v.wper(5.0), "large should be larger than usual");
+    assert_eq!(slight_runner.movement, Movement::Run);
+    assert!(slight_runner.body.h < v.hper(10.0), "a flyer footprint is shallow");
+}
+
+#[test]
+fn every_size_stands_on_the_floor() {
+    // A short one must not hover and a tall one must not sink, or the ground
+    // stops meaning anything.
+    let mut game = new_game();
+    let v = game.viewport;
+    for size in Size::ALL {
+        let z = Recipe { movement: MoveKind::Run, size, shoot: false, blink: false, shed: false, brood: false }
+            .build(&v, 6, 0, &mut game.rng);
+        let feet = z.body.y + z.body.h;
+        assert!(
+            (feet - v.hper(GROUND_Y_PCT)).abs() < 0.01,
+            "{size:?} stands with its feet at {feet}"
+        );
+    }
+}
+
+#[test]
+fn behaviours_land_where_the_recipe_asked() {
+    let mut game = new_game();
+    let v = game.viewport;
+    let all = Recipe {
+        movement: MoveKind::Hop,
+        size: Size::Normal,
+        shoot: true,
+        blink: true,
+        shed: true,
+        brood: false,
+    };
+    let z = all.build(&v, 6, 0, &mut game.rng);
+    assert!(z.behaviors.shoot.is_some());
+    assert!(z.behaviors.blink);
+    assert!(z.behaviors.shed);
+    assert!(z.max_husks > 0, "a shedder needs somewhere to put them");
+    assert!(matches!(z.movement, Movement::Hop { .. }));
+
+    let none = Recipe { shoot: false, blink: false, shed: false, ..all };
+    let z = none.build(&v, 6, 0, &mut game.rng);
+    assert_eq!(z.behaviors, Behaviors::plain());
+    assert_eq!(z.max_husks, 0);
+}
+
+#[test]
+fn rolling_reaches_every_corner_of_the_space() {
+    // If some combination can never come up, the axis it sits on is decoration.
+    // Late enough that every trait has been introduced; what happens before
+    // then is a separate test.
+    let mut rng = Rng::new(20260819);
+    let wave = 40;
+    let (mut moves, mut sizes) = ([false; 4], [false; 4]);
+    let (mut shot, mut blinked, mut shed, mut plain) = (false, false, false, false);
+    for _ in 0..4000 {
+        let r = Recipe::roll(wave, &mut rng);
+        moves[MoveKind::ALL.iter().position(|m| *m == r.movement).unwrap()] = true;
+        sizes[Size::ALL.iter().position(|s| *s == r.size).unwrap()] = true;
+        shot |= r.shoot;
+        blinked |= r.blink;
+        shed |= r.shed;
+        plain |= !r.shoot && !r.blink && !r.shed;
+    }
+    assert!(moves.iter().all(|m| *m), "some way of moving never came up");
+    assert!(sizes.iter().all(|s| *s), "some size never came up");
+    assert!(shot && blinked && shed, "some behaviour never came up");
+    assert!(plain, "a plain one - just heavy - should be an ordinary outcome");
+}
+
+#[test]
+fn a_rolled_enemy_only_carries_what_the_run_has_already_met() {
+    // The example this exists for: a wave-six heavy that shoots, breeds and
+    // lays hazards, when the shooter, the splitter and the shedder have not
+    // appeared once between them.
+    let mut rng = Rng::new(6161);
+    for _ in 0..4000 {
+        let r = Recipe::roll(ELITE_FIRST_WAVE, &mut rng);
+        assert!(!r.shoot, "a shooter has not been seen yet");
+        assert!(!r.blink, "nor a blinker");
+        assert!(!r.shed, "nor a shedder");
+        assert!(!r.brood, "nor anything that makes more of itself");
+    }
+}
+
+#[test]
+fn each_trait_waits_for_the_enemy_it_belongs_to() {
+    // A rolled enemy is read against the roster - the player knows a hop or a
+    // blink because they have met the thing that does it. So each trait waits
+    // for the wave its owner arrives on, and is a live possibility from then.
+    let cases: [(&str, i64, fn(&Recipe) -> bool); 6] = [
+        ("hop", 3, |r| r.movement == MoveKind::Hop),
+        ("leap", 4, |r| r.movement == MoveKind::Leap),
+        ("boss size", 5, |r| r.size == Size::Large),
+        ("brood", 7, |r| r.brood),
+        ("blink", 8, |r| r.blink),
+        ("shoot", 9, |r| r.shoot),
+    ];
+    for (name, at, held) in cases {
+        let mut rng = Rng::new(at as u64 * 104_729 + 17);
+        for _ in 0..4000 {
+            assert!(
+                !held(&Recipe::roll(at - 1, &mut rng)),
+                "{name} came up a wave before the enemy that introduces it"
+            );
+        }
+        let mut rng = Rng::new(at as u64 * 104_729 + 17);
+        let seen = (0..4000).any(|_| held(&Recipe::roll(at, &mut rng)));
+        assert!(seen, "{name} never came up on the wave it unlocks");
+    }
+}
+
+#[test]
+fn a_shed_trait_waits_for_the_shedder_itself() {
+    // Its owner is the one enemy whose wave lives in the config rather than in
+    // the spawn table, so it gets its own check against that number.
+    let mut rng = Rng::new(777);
+    for _ in 0..4000 {
+        assert!(
+            !Recipe::roll(SHEDDER_MIN_WAVE - 1, &mut rng).shed,
+            "a hazard was laid before the shedder ever appeared"
+        );
+    }
+    let mut rng = Rng::new(777);
+    assert!(
+        (0..4000).any(|_| Recipe::roll(SHEDDER_MIN_WAVE, &mut rng).shed),
+        "and never after it did"
+    );
+}
+
+#[test]
+fn the_first_heavies_are_still_worth_meeting() {
+    // Holding traits back must not leave the earliest rolled enemies all the
+    // same thing: movement and size are open from the start, and between them
+    // that is what a wave-six heavy is made of.
+    let mut rng = Rng::new(31415);
+    let mut moves = [false; 4];
+    let mut sizes = [false; 4];
+    for _ in 0..4000 {
+        let r = Recipe::roll(ELITE_FIRST_WAVE, &mut rng);
+        moves[MoveKind::ALL.iter().position(|m| *m == r.movement).unwrap()] = true;
+        sizes[Size::ALL.iter().position(|s| *s == r.size).unwrap()] = true;
+    }
+    assert!(moves.iter().all(|m| *m), "some way of moving is missing at wave six");
+    assert!(sizes.iter().all(|s| *s), "some size is missing at wave six");
+}
+
+#[test]
+fn young_are_held_to_the_same_schedule_as_their_parent() {
+    // A brood must not be a way round the timetable: the parent needed wave
+    // seven to breed at all, and what it breeds is drawn against that wave too.
+    let mut game = new_game();
+    let v = game.viewport;
+    game.state = State::Playing;
+    game.wave = unlock::BROOD;
+    let recipe = Recipe {
+        movement: MoveKind::Run,
+        size: Size::Normal,
+        shoot: false,
+        blink: false,
+        shed: false,
+        brood: true,
+    };
+    game.zombies.clear();
+    game.flyers.clear();
+    game.zombies.push(recipe.build(&v, game.wave, 0, &mut game.rng));
+
+    for _ in 0..12 {
+        let target = game.zombies[0].body;
+        game.players[0].attack_ticks = 0;
+        game.zombies[0].body = target;
+        game.zombies[0].hp = game.zombies[0].hpmax;
+        swing_at(&mut game, 0, target);
+        game.tick(&idle());
+    }
+    let young: Vec<_> = game
+        .zombies
+        .iter()
+        .filter(|z| z.color == ELITE_COLOR && !z.elite)
+        .collect();
+    assert!(!young.is_empty(), "nothing was bred, so nothing is proven");
+    for z in young {
+        assert!(z.behaviors.shoot.is_none(), "a child shot before the shooter existed");
+        assert!(!z.behaviors.blink, "a child blinked before the blinker existed");
+        assert!(!z.behaviors.shed, "a child shed before the shedder existed");
+    }
+}
+
+#[test]
+fn a_rolled_enemy_pays_for_the_work_it_took() {
+    // Eleven swings for the ordinary six points would be an insult, and the
+    // boss flag cannot be borrowed for it: that flag also decides how the wall
+    // treats it.
+    let mut game = new_game();
+    let v = game.viewport;
+    let plain = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    let elite = Recipe { movement: MoveKind::Run, size: Size::Normal, shoot: false, blink: false, shed: false, brood: false }
+        .build(&v, 10, 0, &mut game.rng);
+    assert!(elite.reward > plain.reward * 10, "it should pay like the work it is");
+}
+
+/* ---------------- when rolled heavies arrive ---------------- */
+
+/// Runs a wave's worth of spawn decisions and reports how many heavies it
+/// asked for.
+fn elites_in_wave(wave: i64) -> usize {
+    let mut manager = WaveManager::default();
+    let mut rng = Rng::new(wave as u64 * 7919 + 1);
+    manager.begin_wave(wave, &mut rng);
+    manager.skip_countdown();
+    let mut count = 0;
+    let mut spawned = 0i64;
+    // Room is reported as empty throughout, so the budget is the only limit.
+    for _ in 0..40_000 {
+        match manager.update(wave, spawned, 0, &mut rng) {
+            WaveAction::Idle => {}
+            WaveAction::ClearWave => break,
+            WaveAction::SpawnElite => {
+                count += 1;
+                spawned += 1;
+            }
+            _ => spawned += 1,
+        }
+    }
+    count
+}
+
+#[test]
+fn rolled_heavies_start_at_the_sixth_wave() {
+    // Late enough that the fixed roster has been met: a rolled enemy only reads
+    // as unusual against a set the player already knows.
+    for wave in 1..ELITE_FIRST_WAVE {
+        assert_eq!(elites_in_wave(wave), 0, "wave {wave} should be off the list");
+    }
+    assert_eq!(elites_in_wave(ELITE_FIRST_WAVE), 1);
+}
+
+#[test]
+fn one_rolled_heavy_a_wave_and_never_on_a_boss_wave() {
+    for wave in ELITE_FIRST_WAVE..24 {
+        let want = if wave % 5 == 0 { 0 } else { 1 };
+        assert_eq!(
+            elites_in_wave(wave),
+            want,
+            "wave {wave} produced the wrong number of heavies"
+        );
+    }
+}
+
+#[test]
+fn a_heavy_waits_until_the_wave_is_under_way() {
+    // The wave should open as an ordinary one and then turn, rather than
+    // starting with the hardest thing in it alone on an empty field.
+    let wave = 7;
+    let mut manager = WaveManager::default();
+    let mut rng = Rng::new(4242);
+    manager.begin_wave(wave, &mut rng);
+    manager.skip_countdown();
+    let mut spawned = 0i64;
+    for _ in 0..40_000 {
+        match manager.update(wave, spawned, 0, &mut rng) {
+            WaveAction::Idle => {}
+            WaveAction::ClearWave => break,
+            WaveAction::SpawnElite => {
+                assert!(spawned > 0, "it walked in before anything else did");
+                assert!(
+                    spawned >= wave * 10 / ELITE_ENTRY_FRACTION,
+                    "it walked in after only {spawned} of the wave's budget"
+                );
+                return;
+            }
+            _ => spawned += 1,
+        }
+    }
+    panic!("no heavy arrived at all");
+}
+
+#[test]
+fn a_heavy_reaches_the_field_and_is_named_on_the_way_in() {
+    let mut game = new_game();
+    game.state = State::Playing;
+    game.wave = ELITE_FIRST_WAVE;
+    game.spawn_count = ELITE_FIRST_WAVE * 10;
+    game.waves.skip_countdown();
+
+    for _ in 0..600 {
+        game.tick(&idle());
+        if game.zombies.iter().any(|z| z.elite) {
+            break;
+        }
+    }
+    let heavy = game
+        .zombies
+        .iter()
+        .find(|z| z.elite)
+        .expect("no rolled heavy arrived");
+    assert_eq!(heavy.hpmax, ELITE_HP);
+    // Constructors place enemies against the view; the spawn site is where a
+    // view-relative x becomes a world one. Either edge is fair - what must not
+    // happen is it landing a whole field away because the offset was skipped.
+    let from_view = heavy.body.x - game.camera_x;
+    assert!(
+        (-heavy.body.w..=game.viewport.w).contains(&from_view),
+        "it entered at {from_view} from the view edge"
+    );
+    let name = game.elite_notice().expect("it arrived without a name");
+    assert!(!name.is_empty(), "the one thing that cannot be read off a colour");
+}
+
+#[test]
+fn the_name_does_not_stay_up_forever() {
+    let mut game = new_game();
+    game.elite_notice = Some(("HOPPER SMALL GUN".to_string(), 0));
+    game.timer = ELITE_NOTICE_TICKS - 1;
+    assert!(game.elite_notice().is_some());
+    game.timer = ELITE_NOTICE_TICKS;
+    assert!(game.elite_notice().is_none(), "it should have cleared by now");
+}
+
+#[test]
+fn a_heavy_from_the_last_run_is_not_announced_in_the_next_one() {
+    // The clock goes back to zero at the start of a run. An age read as
+    // `timer - at` then comes out negative, which is "recent" to any test
+    // written as a single bound.
+    let mut game = new_game();
+    game.timer = 5_000;
+    game.elite_notice = Some(("HUGE FLIER GUN".to_string(), 4_950));
+    assert!(game.elite_notice().is_some());
+    game.start_new_run(1);
+    assert!(
+        game.elite_notice().is_none(),
+        "the last run's heavy was announced in this one"
+    );
+}
+
+#[test]
+fn what_a_heavy_turns_out_to_be_is_not_shifted_by_the_fight() {
+    // Same reason the offer has its own generator: two runs that reach wave 6
+    // the same way should meet the same enemy, whatever happened in between.
+    let names = |swings: usize| {
+        let mut game = new_game();
+        game.state = State::Playing;
+        game.wave = ELITE_FIRST_WAVE;
+        game.spawn_count = ELITE_FIRST_WAVE * 10;
+        game.waves.skip_countdown();
+        for i in 0..600 {
+            // The main generator gets churned by the fight; the elite one
+            // must not notice.
+            if i < swings {
+                game.players[0].strike_id = game.players[0].strike_id.wrapping_add(1).max(1);
+                let _ = game.rng.unit();
+            }
+            game.tick(&idle());
+            if let Some(name) = game.elite_notice() {
+                return name.to_string();
+            }
+        }
+        String::new()
+    };
+    let quiet = names(0);
+    assert!(!quiet.is_empty(), "nothing arrived, so nothing is proven");
+    assert_eq!(quiet, names(120), "the fight changed which enemy showed up");
+}
+
+/* ---------------- the brood ---------------- */
+
+/// Young, told apart from what the wave is spawning alongside them.
+///
+/// Counting the whole list would be counting the wave manager's work as well:
+/// it keeps feeding the field while this runs, and an ordinary zombie looks
+/// just like a minion in health and in every flag. The colour does not lie -
+/// only a rolled enemy and its young wear it.
+fn minions(game: &Game) -> usize {
+    game.zombies
+        .iter()
+        .filter(|z| z.color == ELITE_COLOR && !z.elite)
+        .count()
+}
+
+/// A brooder standing in front of player 0, in a state where a swing will land.
+fn brooder(game: &mut Game) -> usize {
+    let v = game.viewport;
+    let recipe = Recipe {
+        movement: MoveKind::Run,
+        size: Size::Normal,
+        shoot: false,
+        blink: false,
+        shed: false,
+        brood: true,
+    };
+    let z = recipe.build(&v, 6, 0, &mut game.rng);
+    game.zombies.clear();
+    game.flyers.clear();
+    game.zombies.push(z);
+    game.state = State::Playing;
+    0
+}
+
+#[test]
+fn a_brooder_answers_a_swing_with_young() {
+    let mut game = new_game();
+    brooder(&mut game);
+    let target = game.zombies[0].body;
+    swing_at(&mut game, 0, target);
+    game.tick(&idle());
+    assert!(minions(&game) > 0, "the blow should have produced young");
+    for z in game.zombies.iter().filter(|z| !z.elite) {
+        assert!(!z.broods, "a brood that broods never stops");
+    }
+    for z in game.zombies.iter().filter(|z| z.color == ELITE_COLOR && !z.elite) {
+        assert_eq!(z.hpmax, 255.0, "they die to one swing like anything else");
+    }
+}
+
+#[test]
+fn one_brood_per_swing_and_not_per_tick() {
+    // The distinction the whole feature turns on: a swing covers an enemy for
+    // most of a dozen ticks. Paying per tick would fill the field from one hit.
+    let mut game = new_game();
+    brooder(&mut game);
+    let target = game.zombies[0].body;
+    swing_at(&mut game, 0, target);
+
+    let mut counts = alloc::vec![minions(&game)];
+    for _ in 0..ATTACK_TICKS {
+        // Pin it in place so the swing keeps reaching it for the whole arc.
+        game.zombies[0].body = target;
+        game.tick(&idle());
+        counts.push(minions(&game));
+    }
+    let grew = counts.windows(2).filter(|w| w[1] > w[0]).count();
+    assert_eq!(grew, 1, "it should have bred exactly once, not {grew} times");
+}
+
+#[test]
+fn a_second_swing_breeds_again() {
+    let mut game = new_game();
+    brooder(&mut game);
+    let target = game.zombies[0].body;
+
+    swing_at(&mut game, 0, target);
+    game.tick(&idle());
+    let after_first = minions(&game);
+
+    game.players[0].attack_ticks = 0;
+    game.zombies[0].body = target;
+    swing_at(&mut game, 0, target);
+    game.tick(&idle());
+    assert!(
+        minions(&game) > after_first,
+        "a fresh swing is a fresh blow, so it should breed again"
+    );
+}
+
+#[test]
+fn a_brood_cannot_outgrow_the_wave_it_is_in() {
+    // Otherwise a brooder is not a hard enemy, it is a losing race: every blow
+    // that fails to kill it leaves more on the field than before.
+    let mut game = new_game();
+    brooder(&mut game);
+    let cap = max_concurrent_enemies(game.wave);
+    let ceiling = cap + BROOD_MAX as usize;
+    let target = game.zombies[0].body;
+
+    for _ in 0..40 {
+        game.players[0].attack_ticks = 0;
+        game.zombies[0].body = target;
+        game.zombies[0].hp = game.zombies[0].hpmax;
+        swing_at(&mut game, 0, target);
+        game.tick(&idle());
+        assert!(
+            game.zombies.len() + game.flyers.len() <= ceiling,
+            "the field ran past the crowd limit"
+        );
+    }
+}
+
+#[test]
+fn the_wall_does_not_seed_the_field() {
+    // The ultimate exists to clear a field, not to fill one.
+    let mut game = new_game();
+    brooder(&mut game);
+    game.zombies[0].hp = ELITE_HP; // survives the wall's 300
+    let target = game.zombies[0].body;
+    raise_wall_over(&mut game, target);
+    for _ in 0..20 {
+        game.zombies[0].body = target;
+        game.tick(&idle());
+    }
+    assert_eq!(minions(&game), 0, "the wall bred it");
+    assert!(game.zombies[0].hp < ELITE_HP, "but the wall should still bite");
+}
+
+/* ---------------- movement and behaviour axes ---------------- */
+
+#[test]
+fn the_named_variants_land_on_the_axis_they_belong_to() {
+    // Moving is a choice and behaving is a set. A preset that put its trick on
+    // the wrong axis would quietly become uncombinable, or exclusive with
+    // something it has no quarrel with.
+    let mut game = new_game();
+    let v = game.viewport;
+
+    let jumper = Zombie::jumper(&v, &mut game.rng);
+    assert!(matches!(jumper.movement, Movement::Hop { .. }));
+    assert_eq!(jumper.behaviors, Behaviors::plain());
+
+    let leaper = Zombie::leaper(&v, &mut game.rng);
+    assert!(matches!(leaper.movement, Movement::Leap(_)));
+
+    let shooter = Zombie::shooter(&v, &mut game.rng);
+    assert_eq!(shooter.movement, Movement::Run, "shooting is not a way of moving");
+    assert!(shooter.behaviors.shoot.is_some());
+
+    let shedder = Zombie::shedder(&v, &mut game.rng);
+    assert_eq!(shedder.movement, Movement::Run);
+    assert!(shedder.behaviors.shed);
+}
+
+#[test]
+fn behaviours_combine_where_movements_cannot() {
+    // The whole point of the split: one enemy may shoot and shed and blink at
+    // once, and the type still only lets it move one way.
+    let mut game = new_game();
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.behaviors.shoot = Some(0);
+    z.behaviors.shed = true;
+    z.behaviors.blink = true;
+    z.movement = Movement::Hop { cooldown: 0 };
+
+    assert!(z.behaviors.shoot.is_some() && z.behaviors.shed && z.behaviors.blink);
+    assert!(matches!(z.movement, Movement::Hop { .. }));
+}
+
+#[test]
+fn a_flying_enemy_rides_an_arc_instead_of_falling() {
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    clear_arena(&mut game);
+
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.movement = Movement::Fly { offset: 0 };
+    z.hp = 1_000_000.0;
+    z.hpmax = z.hp;
+    game.zombies.push(z);
+
+    // y grows downward, so the top of the arc is the smallest number.
+    let ground = v.hper(GROUND_Y_PCT);
+    let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+    for _ in 0..400 {
+        game.flyers.clear();
+        game.tick(&idle());
+        let Some(z) = game.zombies.iter().find(|z| z.hpmax > 1000.0) else {
+            panic!("the flier died");
+        };
+        top = top.min(z.body.y);
+        bottom = bottom.max(z.body.y);
+    }
+
+    // It climbs to the ceiling of the arc, which gravity would never allow.
+    assert!(
+        top <= v.hper(FLYER_ARC_TOP_PCT) + v.hper(2.0),
+        "it only climbed to {top}"
+    );
+    // And it dips to where a player standing on the floor can still reach it,
+    // for the same reason an ordinary flyer's arc bottoms out where it does -
+    // without ever resting on the floor itself.
+    assert!(
+        bottom >= v.hper(FLYER_ARC_BOTTOM_PCT) - v.hper(2.0),
+        "the dip only reached {bottom}"
+    );
+    assert!(bottom < ground, "it should never come to rest on the floor");
+}
+
+#[test]
+fn a_flying_enemy_still_chases() {
+    // Flying replaces gravity, not the walk: it should close on the player the
+    // way anything else does, or it would just bob in place.
+    let mut game = new_game();
+    game.start_run(1);
+    settle_on_floor(&mut game);
+    clear_arena(&mut game);
+
+    let v = game.viewport;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.movement = Movement::Fly { offset: 0 };
+    z.hp = 1_000_000.0;
+    z.hpmax = z.hp;
+    z.body.x = game.players[0].body.x + v.wper(60.0);
+    let started = z.body.x;
+    game.zombies.push(z);
+
+    for _ in 0..60 {
+        game.flyers.clear();
+        game.tick(&idle());
+    }
+    let now = game.zombies.iter().find(|z| z.hpmax > 1000.0).unwrap().body.x;
+    assert!(now < started, "it drifted away instead of closing in");
+}
+
 /* ---------------- the wall against bosses ---------------- */
 
 /// Puts an active ultimate field over `body`, as if the player had slammed.
 fn raise_wall_over(game: &mut Game, body: Body) {
     game.players[0].field.active = true;
     game.players[0].field.body = body;
+    // Raising a wall for real takes a fresh action number, which is what stops
+    // it landing on the same enemy on every one of the ~17 ticks it stands.
+    // A hand-made one has to take it too.
+    game.players[0].strike_id = game.players[0].strike_id.wrapping_add(1).max(1);
 }
 
 #[test]
@@ -2720,6 +3372,84 @@ fn the_wall_still_ends_anything_ordinary() {
         !game.zombies.iter().any(|z| z.color == TEST_ENEMY_COLOR),
         "the wall should still clear ordinary enemies outright"
     );
+}
+
+#[test]
+fn the_wall_wears_down_something_heavier_instead_of_deleting_it() {
+    // The point of the flat number: an enemy built to take punishment should
+    // take it from the wall too. It used to set health to -1 whatever the enemy
+    // was, so no heavy one could exist below boss rank.
+    let mut game = new_game();
+    game.start_run(1);
+    clear_arena(&mut game);
+
+    let mut z = Zombie::from_edge(&game.viewport, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.x = game.players[0].body.x;
+    z.body.y = game.players[0].body.y;
+    // Twice an armoured one, which is what a mini-boss is meant to carry.
+    z.hp = 255.0 * 2.0;
+    z.hpmax = z.hp;
+    let body = z.body;
+    game.zombies.push(z);
+
+    raise_wall_over(&mut game, body);
+    game.tick(&idle());
+    game.tick(&idle());
+    let survivor = game
+        .zombies
+        .iter()
+        .find(|z| z.color == TEST_ENEMY_COLOR)
+        .expect("510 health should not fall to one wall");
+    assert_eq!(survivor.hp, 510.0 - FIELD_DAMAGE);
+
+    // And the second wall finishes it, so it is worn down rather than immune.
+    raise_wall_over(&mut game, body);
+    game.tick(&idle());
+    game.tick(&idle());
+    assert!(
+        !game.zombies.iter().any(|z| z.color == TEST_ENEMY_COLOR),
+        "a second wall should finish it"
+    );
+}
+
+#[test]
+fn one_wall_still_clears_every_ordinary_variant() {
+    // The flat number is just past the 255 they all carry, so nothing that
+    // existed before the change survives a touch. This is the guard on that.
+    let build: [(&str, fn(&Viewport, &mut Rng) -> Zombie); 8] = [
+        ("runt", Zombie::runt),
+        ("jumper", Zombie::jumper),
+        ("leaper", Zombie::leaper),
+        ("armored", Zombie::armored),
+        ("frenzied", Zombie::frenzied),
+        ("splitter", Zombie::splitter),
+        ("blinker", Zombie::blinker),
+        ("shooter", Zombie::shooter),
+    ];
+    for (name, make) in build {
+        let mut game = new_game();
+        game.start_run(1);
+        clear_arena(&mut game);
+
+        let v = game.viewport;
+        let mut z = make(&v, &mut game.rng);
+        z.body.x = game.players[0].body.x;
+        z.body.y = game.players[0].body.y;
+        // By colour, not by health: two ticks is long enough for the wave to
+        // spawn another enemy carrying the same 255, and it would read as a
+        // survivor.
+        let marker = z.color;
+        let body = z.body;
+        game.zombies.push(z);
+
+        raise_wall_over(&mut game, body);
+        game.tick(&idle());
+        game.tick(&idle());
+        assert!(
+            !game.zombies.iter().any(|z| z.color == marker),
+            "the wall no longer clears a {name}"
+        );
+    }
 }
 
 /* ---------------- enemy colour ---------------- */
@@ -3512,7 +4242,9 @@ fn the_shove_outlasts_the_dash_by_three_frames() {
 #[test]
 fn a_husk_still_hurts_a_dashing_player() {
     // The husk is the one thing a dash cannot shove: it takes no damage and
-    // does not move, which makes it the counter to the crowd-clear.
+    // does not move, which makes it the counter to the crowd-clear. Everything
+    // else on the field a dash goes through untouched, hazard included would
+    // leave nothing a dash could not simply drive over.
     let mut game = new_game();
     ready_to_dash(&mut game);
     clear_arena(&mut game);
@@ -3776,9 +4508,209 @@ fn the_attack_row_cycles_through_every_kind_and_back() {
 }
 
 #[test]
+fn down_still_brings_you_down_on_a_wave_with_no_jumping() {
+    // The player did not choose to be up there - a hit put them there - and
+    // with the wall raised from standing instead, down had nothing left to do.
+    let mut game = player_with(Boons::default());
+    game.state = State::Playing;
+    game.waves.rule = WaveRule::NoJumps;
+    let v = game.viewport;
+
+    let drop_from = |game: &mut Game, slam: bool| {
+        game.players[0].body.y = v.hper(30.0);
+        game.players[0].ay = 0.0;
+        game.players[0].grounded = false;
+        let mut frame = idle();
+        frame.players[0].slam = slam;
+        game.tick(&frame);
+        game.players[0].ay
+    };
+
+    let drifting = drop_from(&mut game, false);
+    let slammed = drop_from(&mut game, true);
+    assert!(
+        slammed > drifting,
+        "down should hurry the fall: {slammed} against {drifting}"
+    );
+}
+
+#[test]
+fn coming_down_on_a_wave_with_no_jumping_cannot_be_punished() {
+    // Down is the only way back to the floor there, and the floor is where the
+    // wall goes up. A descent that could be hit on the way would make the one
+    // recovery that wave offers a worse idea than drifting.
+    let mut game = player_with(Boons::default());
+    game.state = State::Playing;
+    game.waves.rule = WaveRule::NoJumps;
+    let v = game.viewport;
+    game.players[0].body.y = v.hper(30.0);
+    game.players[0].grounded = false;
+
+    let mut frame = idle();
+    frame.players[0].slam = true;
+    game.tick(&frame);
+
+    assert!(game.players[0].field.readiness, "the wall should be on its way");
+    assert!(
+        game.players[0].untouchable(game.timer, Reach::Normal),
+        "and the fall should be covered"
+    );
+
+    let full = game.players[0].hp;
+    let source = Body::new(0.0, 0.0, 10.0, 10.0);
+    game.damage_player(0, 40.0, &source, Reach::Normal);
+    assert_eq!(game.players[0].hp, full, "something reached it on the way down");
+}
+
+#[test]
+fn the_landing_on_a_wave_with_no_jumping_still_puts_the_wall_up() {
+    // The cover is not free: it is the wall being raised, and it is paid for
+    // out of the same charge raising one from standing costs.
+    let mut game = player_with(Boons::default());
+    game.state = State::Playing;
+    game.waves.rule = WaveRule::NoJumps;
+    let v = game.viewport;
+    game.players[0].super_charges = 1;
+    game.players[0].body.y = v.hper(30.0);
+    game.players[0].grounded = false;
+
+    let mut frame = idle();
+    frame.players[0].slam = true;
+    game.tick(&frame);
+    for _ in 0..60 {
+        game.tick(&idle());
+        if game.players[0].field.active {
+            break;
+        }
+    }
+    assert!(game.players[0].field.active, "it never went up");
+    assert_eq!(game.players[0].super_charges, 0, "and it should have been paid for");
+    assert!(!game.players[0].field.readiness, "the intent is spent either way");
+}
+
+#[test]
+fn a_landing_with_nothing_to_pay_with_does_not_stay_covered() {
+    // Otherwise pressing down on an empty bar would buy permanent cover: the
+    // intent has to be spent whether or not it bought anything.
+    let mut game = player_with(Boons::default());
+    game.state = State::Playing;
+    game.waves.rule = WaveRule::NoJumps;
+    let v = game.viewport;
+    game.players[0].super_charges = 0;
+    game.players[0].body.y = v.hper(30.0);
+    game.players[0].grounded = false;
+
+    let mut frame = idle();
+    frame.players[0].slam = true;
+    game.tick(&frame);
+    for _ in 0..60 {
+        game.tick(&idle());
+    }
+    assert!(!game.players[0].field.readiness, "it stayed armed with nothing to arm");
+    assert!(!game.players[0].field.active);
+    assert!(
+        !game.players[0].untouchable(game.timer, Reach::Normal),
+        "and so it should be touchable again"
+    );
+}
+
+#[test]
+fn a_wave_with_no_jumping_still_will_not_let_you_jump() {
+    // Giving down its job back must not give the button above it one.
+    let mut game = player_with(Boons { double_jump: true, ..Default::default() });
+    game.state = State::Playing;
+    game.waves.rule = WaveRule::NoJumps;
+    let floor = game.players[0].body.y;
+    let mut frame = idle();
+    frame.players[0].jump = true;
+    for _ in 0..4 {
+        game.tick(&frame);
+    }
+    assert!(game.players[0].body.y >= floor, "it left the floor anyway");
+}
+
+#[test]
+fn the_dev_menu_can_hand_out_every_upgrade_at_once() {
+    // Reaching one in a real run costs tens of thousands of points, and most of
+    // what wants testing wants all of them together.
+    let mut dev = DevSetup::default();
+    assert!(!dev.all_boons());
+
+    dev.toggle_all_boons();
+    assert!(dev.all_boons(), "one press should turn the lot on");
+    assert!(dev.boons.double_jump && dev.boons.dash_free && dev.boons.shield);
+    assert_ne!(
+        dev.boons.wall,
+        WallMod::Plain,
+        "the wall should go to a modified one - plain is what off looks like"
+    );
+
+    dev.toggle_all_boons();
+    assert_eq!(dev.boons, Boons::default(), "and the next press should clear it");
+}
+
+#[test]
+fn each_upgrade_can_also_be_set_on_its_own() {
+    let mut dev = DevSetup::default();
+    dev.toggle_double_jump();
+    assert!(dev.boons.double_jump);
+    assert!(!dev.boons.dash_free && !dev.boons.shield, "only the one asked for");
+    assert!(!dev.all_boons(), "one of four is not all of them");
+
+    dev.toggle_dash_free();
+    dev.toggle_shield();
+    assert!(!dev.all_boons(), "the wall is one of them too");
+    dev.cycle_wall(1);
+    assert!(dev.all_boons());
+
+    dev.toggle_double_jump();
+    assert!(!dev.boons.double_jump, "a switch goes both ways");
+}
+
+#[test]
+fn the_wall_cycles_through_all_three_and_comes_back() {
+    let mut dev = DevSetup::default();
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        dev.cycle_wall(1);
+        seen.push(dev.boons.wall);
+    }
+    assert!(seen.contains(&WallMod::Pull) && seen.contains(&WallMod::Push));
+    assert_eq!(dev.boons.wall, WallMod::Plain, "three steps should be a full turn");
+    dev.cycle_wall(-1);
+    assert_eq!(dev.boons.wall, WallMod::Push, "and it should turn the other way too");
+}
+
+#[test]
+fn a_dev_run_starts_holding_what_the_menu_showed() {
+    let mut game = new_game();
+    game.dev.players = 2;
+    game.dev.toggle_all_boons();
+    let wanted = game.dev.boons;
+    game.start_dev_run();
+
+    assert_eq!(game.players.len(), 2);
+    for p in game.players.iter() {
+        assert_eq!(p.boons, wanted, "every player should start with them");
+    }
+}
+
+#[test]
+fn an_ordinary_run_still_starts_with_nothing() {
+    // The dev menu pins these for its own runs only; the title screen must not
+    // inherit whatever was left set there.
+    let mut game = new_game();
+    game.dev.toggle_all_boons();
+    game.start_run(1);
+    assert_eq!(game.players[0].boons, Boons::default());
+}
+
+#[test]
 fn the_dev_menu_fits_on_a_psp_screen() {
-    // Nine rows at the usual pitch run off the bottom of a 480x272 panel, under
-    // the floor band. The menu carries its own pitch for exactly this reason.
+    // The dev menu has more rows than any other and keeps growing - every
+    // parameter worth starting a run with ends up here. At the usual pitch they
+    // run off the bottom of a 480x272 panel, under the floor band, which is why
+    // this menu carries a pitch of its own.
     let game = single_player_platform();
     let rows = game.menu_rows([true, false]).len();
     let last = game.dev_menu.row_y_pct(rows - 1);
@@ -3821,7 +4753,7 @@ fn plant_shedder(game: &mut Game) -> Body {
 fn the_shedder(game: &Game) -> &Zombie {
     game.zombies
         .iter()
-        .find(|z| z.behavior == Behavior::Shedder)
+        .find(|z| z.behaviors.shed)
         .expect("the shedder is gone")
 }
 
@@ -3920,7 +4852,7 @@ fn a_husk_hurts_on_contact() {
     let k = game
         .zombies
         .iter()
-        .position(|z| z.behavior == Behavior::Shedder)
+        .position(|z| z.behaviors.shed)
         .unwrap();
     game.zombies[k].husks.push(over_player);
 
@@ -3940,7 +4872,7 @@ fn a_husk_cannot_be_hurt_back() {
     let k = game
         .zombies
         .iter()
-        .position(|z| z.behavior == Behavior::Shedder)
+        .position(|z| z.behaviors.shed)
         .unwrap();
     let mut husk = game.zombies[k].body;
     husk.x = game.players[0].body.x + v.wper(8.0);
@@ -3970,7 +4902,7 @@ fn husks_go_when_their_parent_does() {
     let k = game
         .zombies
         .iter()
-        .position(|z| z.behavior == Behavior::Shedder)
+        .position(|z| z.behaviors.shed)
         .unwrap();
     game.zombies[k].husks.push(body);
     // One swing's worth of health left. An enemy is only ever collected inside
@@ -3983,7 +4915,7 @@ fn husks_go_when_their_parent_does() {
     game.tick(&idle());
 
     assert!(
-        !game.zombies.iter().any(|z| z.behavior == Behavior::Shedder),
+        !game.zombies.iter().any(|z| z.behaviors.shed),
         "the shedder should be gone"
     );
     assert!(
@@ -4004,7 +4936,7 @@ fn husks_do_not_hold_a_wave_open() {
     let k = game
         .zombies
         .iter()
-        .position(|z| z.behavior == Behavior::Shedder)
+        .position(|z| z.behaviors.shed)
         .unwrap();
     for _ in 0..5 {
         game.zombies[k].husks.push(body);
@@ -4021,7 +4953,7 @@ fn the_shedder_boss_borrows_the_first_boss_health_and_keeps_every_husk() {
     let plain = Zombie::boss(&v, SHEDDER_BOSS_HEALTH_WAVE, &mut game.rng);
 
     assert!(boss.is_boss);
-    assert_eq!(boss.behavior, Behavior::Shedder);
+    assert!(boss.behaviors.shed);
     assert_eq!(boss.hpmax, plain.hpmax, "it should keep the first boss's health");
     assert!(boss.max_husks > SHEDDER_HUSKS, "the boss should not replace its husks");
 }
@@ -4173,6 +5105,692 @@ fn the_background_says_whether_a_wave_is_running() {
     assert!(fighting.r > fighting.g, "a running wave should be the red one");
 }
 
+/* ---------------- boons ---------------- */
+
+/// A player standing on the floor with `boons`, mid-run.
+fn player_with(boons: Boons) -> Game {
+    let mut game = new_game();
+    game.start_run(1);
+    game.players[0].boons = boons;
+    // Settled after the boons are set, not before: the air jump is stocked by
+    // standing on the floor, so a player who was already standing when the
+    // offer was taken picks it up on the next tick.
+    settle_on_floor(&mut game);
+    game
+}
+
+fn jump_intent() -> InputFrame {
+    let mut frame = idle();
+    frame.players[0].jump = true;
+    frame
+}
+
+#[test]
+fn without_the_boon_there_is_no_jump_in_the_air() {
+    let mut game = player_with(Boons::default());
+    game.tick(&jump_intent());
+    assert!(!game.players[0].grounded, "the first jump should have left the floor");
+    let rising = game.players[0].ay;
+    game.tick(&jump_intent());
+    assert!(
+        game.players[0].ay > rising,
+        "a second press in the air should do nothing but let gravity work"
+    );
+}
+
+#[test]
+fn the_boon_buys_exactly_one_jump_off_nothing() {
+    let mut game = player_with(Boons { double_jump: true, ..Default::default() });
+    game.tick(&jump_intent());
+    assert_eq!(game.players[0].air_jumps, 1, "grounded, the stock should be full");
+
+    // Fall for a while, so the second jump is unmistakably a fresh push rather
+    // than the first one still going.
+    for _ in 0..30 {
+        game.tick(&idle());
+    }
+    let falling = game.players[0].ay;
+    assert!(falling > 0.0, "it should be on the way down by now");
+
+    game.tick(&jump_intent());
+    assert!(game.players[0].ay < falling, "the air jump should have pushed up");
+    assert_eq!(game.players[0].air_jumps, 0, "and there should be none left");
+
+    let rising = game.players[0].ay;
+    game.tick(&jump_intent());
+    assert!(game.players[0].ay > rising, "a third press buys nothing");
+}
+
+#[test]
+fn landing_refills_the_air_jump() {
+    let mut game = player_with(Boons { double_jump: true, ..Default::default() });
+    game.players[0].air_jumps = 0;
+    settle_on_floor(&mut game);
+    assert_eq!(game.players[0].air_jumps, 1, "the floor should have given it back");
+}
+
+#[test]
+fn a_wave_that_forbids_jumping_forbids_the_air_jump_too() {
+    // A boon does not buy back a system the wave rule turned off.
+    let mut game = player_with(Boons { double_jump: true, ..Default::default() });
+    game.waves.rule = WaveRule::NoJumps;
+    let before = game.players[0].body.y;
+    for _ in 0..4 {
+        game.tick(&jump_intent());
+    }
+    assert!(
+        game.players[0].body.y >= before,
+        "it left the floor on a wave with no jumps"
+    );
+}
+
+#[test]
+fn a_free_dash_skips_the_wait_but_not_the_price() {
+    let mut game = player_with(Boons { dash_free: true, ..Default::default() });
+    game.players[0].energy = 100_000;
+    let mut frame = idle();
+    frame.players[0].dash = true;
+
+    game.tick(&frame);
+    assert!(game.players[0].dashing(), "the first dash should have started");
+    for _ in 0..DASH_TICKS {
+        game.tick(&idle());
+    }
+    assert!(!game.players[0].dashing());
+    assert_eq!(
+        game.players[0].dash_cooldown, 0,
+        "a free dash should not leave the indicator saying wait"
+    );
+
+    let before = game.players[0].energy;
+    game.tick(&frame);
+    assert!(game.players[0].dashing(), "and the next one should start at once");
+    assert!(game.players[0].energy < before, "but it is still paid for");
+}
+
+#[test]
+fn a_free_dash_still_runs_out_of_energy() {
+    // Removing the wait leaves the bar as the only gate; without one, the dash
+    // would be a permanently open door.
+    let mut game = player_with(Boons { dash_free: true, ..Default::default() });
+    game.players[0].energy = 0;
+    game.players[0].super_charges = 0;
+    let mut frame = idle();
+    frame.players[0].dash = true;
+    game.tick(&frame);
+    assert!(!game.players[0].dashing(), "nothing left to pay with");
+}
+
+#[test]
+fn the_shield_eats_one_touch_then_waits() {
+    let mut game = player_with(Boons { shield: true, ..Default::default() });
+    let source = Body::new(0.0, 0.0, 10.0, 10.0);
+    let full = game.players[0].hp;
+    assert!(game.players[0].shield_up(game.timer));
+
+    game.damage_player(0, 40.0, &source, Reach::Normal);
+    assert_eq!(game.players[0].hp, full, "the first touch should have been absorbed");
+    assert!(!game.players[0].shield_up(game.timer), "and the shield should be down");
+
+    game.damage_player(0, 40.0, &source, Reach::Normal);
+    assert!(game.players[0].hp < full, "the second one should land");
+
+    game.timer += SHIELD_COOLDOWN_TICKS;
+    assert!(game.players[0].shield_up(game.timer), "a second later it is back");
+}
+
+#[test]
+fn the_shield_still_throws_the_player_clear() {
+    // Absorbing a hit must not also mean standing in it: the throw is what
+    // carries the player out of reach of the next one.
+    let mut game = player_with(Boons { shield: true, ..Default::default() });
+    let source = Body::new(game.players[0].body.x + 200.0, 0.0, 10.0, 10.0);
+    game.damage_player(0, 40.0, &source, Reach::Normal);
+    assert!(
+        game.players[0].knockback_x < 0.0,
+        "it should have been thrown away from what touched it"
+    );
+}
+
+/// Every way of being unable to be hurt, by the name it goes by in play.
+fn protections() -> [(&'static str, fn(&mut Game)); 4] {
+    [
+        ("bought invulnerability", |g: &mut Game| g.players[0].invulnerable = true),
+        ("a wall standing", |g: &mut Game| {
+            let b = g.players[0].body;
+            let v = g.viewport;
+            g.players[0].field.activate(&b, &v);
+        }),
+        ("a wall on the way up", |g: &mut Game| g.players[0].field.readiness = true),
+        ("a dash", |g: &mut Game| {
+            g.players[0].dash_ticks = DASH_TICKS;
+            g.players[0].dash_dir = 1.0;
+        }),
+    ]
+}
+
+#[test]
+fn no_protection_lets_anything_through() {
+    // The point of putting them in one place: it used to matter *what* was
+    // hitting you. A shot and a shedder's hazard do not go through the sites
+    // where an enemy body touches the player, so they reached straight through
+    // a raised wall and through a dash.
+    for (name, arm) in protections() {
+        let mut game = player_with(Boons::default());
+        arm(&mut game);
+        let source = Body::new(0.0, 0.0, 10.0, 10.0);
+        let full = game.players[0].hp;
+        game.damage_player(0, 40.0, &source, Reach::Normal);
+        assert_eq!(game.players[0].hp, full, "{name} let a hit through");
+    }
+}
+
+#[test]
+fn being_untouchable_does_not_spend_the_shield() {
+    // A hit that could not have landed anyway must not cost the one that
+    // matters later. This is what "fully untouchable" has to mean, or the
+    // shield quietly pays for every shot fired at a player behind a wall.
+    for (name, arm) in protections() {
+        let mut game = player_with(Boons { shield: true, ..Default::default() });
+        arm(&mut game);
+        let source = Body::new(0.0, 0.0, 10.0, 10.0);
+        game.damage_player(0, 40.0, &source, Reach::Normal);
+        assert!(
+            game.players[0].shield_up(game.timer),
+            "{name} spent the shield for nothing"
+        );
+    }
+}
+
+#[test]
+fn a_hazard_that_reaches_a_dashing_player_does_spend_the_shield() {
+    // It is a real hit, so the shield is what stops it - and pays. Only hits
+    // that could not have landed anyway are free.
+    let mut game = player_with(Boons { shield: true, ..Default::default() });
+    game.players[0].dash_ticks = DASH_TICKS;
+    game.players[0].dash_dir = 1.0;
+    let source = Body::new(0.0, 0.0, 10.0, 10.0);
+    let full = game.players[0].hp;
+    game.damage_player(0, 40.0, &source, Reach::ThroughDash);
+    assert_eq!(game.players[0].hp, full, "the shield should have taken it");
+    assert!(!game.players[0].shield_up(game.timer), "and been spent doing so");
+}
+
+#[test]
+fn a_shield_alone_still_pays_for_the_hit_it_stops() {
+    // The mirror of the above: with nothing else protecting them, the shield is
+    // what took the hit, and it should show.
+    let mut game = player_with(Boons { shield: true, ..Default::default() });
+    let source = Body::new(0.0, 0.0, 10.0, 10.0);
+    let full = game.players[0].hp;
+    game.damage_player(0, 40.0, &source, Reach::Normal);
+    assert_eq!(game.players[0].hp, full, "the shield should have absorbed it");
+    assert!(!game.players[0].shield_up(game.timer), "and been spent doing so");
+}
+
+#[test]
+fn a_dash_is_the_one_protection_that_is_not_thrown_about() {
+    // Being untouchable should not mean being immovable - except mid-dash,
+    // which is a committed trajectory. A throw there sets `ay` and lifts the
+    // player straight out of their own dash.
+    let mut game = player_with(Boons::default());
+    game.players[0].invulnerable = true;
+    let source = Body::new(game.players[0].body.x + 200.0, 0.0, 10.0, 10.0);
+    game.damage_player(0, 40.0, &source, Reach::Normal);
+    assert!(game.players[0].knockback_x != 0.0, "it should still be shoved");
+
+    let mut game = player_with(Boons::default());
+    game.players[0].dash_ticks = DASH_TICKS;
+    game.players[0].dash_dir = 1.0;
+    let before = game.players[0].ay;
+    game.damage_player(0, 40.0, &source, Reach::Normal);
+    assert_eq!(game.players[0].knockback_x, 0.0, "a dash should not be shoved");
+    assert_eq!(game.players[0].ay, before, "nor lifted out of itself");
+}
+
+#[test]
+fn a_shot_cannot_reach_through_a_wall_or_a_dash() {
+    // Driven through the real projectile path rather than `damage_player`, so
+    // the guard is proven where it actually has to hold.
+    for (name, arm) in protections() {
+        let mut game = player_with(Boons::default());
+        let v = game.viewport;
+        game.state = State::Playing;
+        game.zombies.clear();
+        game.flyers.clear();
+        // Off the floor: landing is what spends the bought invulnerability, and
+        // a player standing on the ground loses it on the first tick.
+        game.players[0].body.y -= v.hper(20.0);
+        game.players[0].grounded = false;
+        arm(&mut game);
+        let p = game.players[0].body;
+        game.projectiles.push(Projectile {
+            // Wide enough that a dash cannot step out of it: what is under test
+            // is the guard, not whether the shot connects.
+            body: Body::new(p.x - v.wper(10.0), p.y, v.wper(25.0), v.hper(8.0)),
+            ax: 0.0,
+            ay: 0.0,
+            damage: 20.0,
+            dead: false,
+        });
+        let full = game.players[0].hp;
+        game.tick(&idle());
+        assert_eq!(game.players[0].hp, full, "a shot got through {name}");
+    }
+}
+
+#[test]
+fn a_hazard_reaches_through_a_dash_and_nothing_else() {
+    for (name, arm) in protections() {
+        let mut game = player_with(Boons::default());
+        let v = game.viewport;
+        game.state = State::Playing;
+        game.zombies.clear();
+        game.flyers.clear();
+        // Off the floor: landing is what spends the bought invulnerability, and
+        // a player standing on the ground loses it on the first tick.
+        game.players[0].body.y -= v.hper(20.0);
+        game.players[0].grounded = false;
+        arm(&mut game);
+        let p = game.players[0].body;
+        let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+        // Well clear of the player: the husk it left behind is the threat.
+        z.body.x = p.x + v.wper(40.0);
+        z.max_husks = 4;
+        z.husks.push(Body::new(p.x, p.y, p.w, p.h));
+        game.zombies.push(z);
+        let full = game.players[0].hp;
+        game.tick(&idle());
+        if name == "a dash" {
+            assert!(
+                game.players[0].hp < full,
+                "the one counter to the crowd-clear stopped working"
+            );
+        } else {
+            assert_eq!(game.players[0].hp, full, "a hazard got through {name}");
+        }
+    }
+}
+
+#[test]
+fn boons_belong_to_a_run_and_not_to_a_death_between_waves() {
+    let all = Boons { double_jump: true, dash_free: true, shield: true, wall: WallMod::Plain };
+    let mut game = player_with(all);
+    let v = game.viewport;
+
+    game.players[0].revive(&v, 0.0);
+    assert_eq!(game.players[0].boons, all, "dying between waves should not cost them");
+
+    game.start_new_run(1);
+    assert_eq!(
+        game.players[0].boons,
+        Boons::default(),
+        "a fresh run should start with nothing"
+    );
+}
+
+#[test]
+fn a_boon_already_held_is_never_offered_again() {
+    let v = Viewport::new(1280.0, 800.0);
+    let mut rng = Rng::new(31337);
+    let held = Boons { double_jump: true, shield: true, ..Default::default() };
+    for _ in 0..500 {
+        let offer = Offer::roll(&v, 0.0, 700.0, AttackKind::Basic, 1, held, 0, &mut rng);
+        for choice in offer.choices.iter() {
+            if let OfferItem::Boon(boon) = choice.item {
+                assert!(!held.has(boon), "{boon:?} was offered though it is held");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_drained_pool_has_only_the_wall_swap_left() {
+    // What stops boons swallowing the weapon roster: the pool drains. It never
+    // empties completely, because the two walls are one setting and the one not
+    // in use is always a live choice - but one option out of eleven is not what
+    // swallows a roster.
+    let v = Viewport::new(1280.0, 800.0);
+    let mut rng = Rng::new(4242);
+    let all = Boons {
+        double_jump: true,
+        dash_free: true,
+        shield: true,
+        wall: WallMod::Push,
+    };
+    let mut weapons = 0;
+    let mut boons = 0;
+    for _ in 0..200 {
+        let offer = Offer::roll(&v, 0.0, 700.0, AttackKind::Hammer, 2, all, 0, &mut rng);
+        for choice in offer.choices.iter() {
+            match choice.item {
+                OfferItem::Attack { .. } => weapons += 1,
+                OfferItem::Boon(b) => {
+                    assert_eq!(b, Boon::WallPull, "a spent boon came back round");
+                    boons += 1;
+                }
+            }
+        }
+    }
+    assert!(weapons > boons * 3, "a drained pool should be mostly weapons");
+}
+
+#[test]
+fn every_boon_can_come_up() {
+    let v = Viewport::new(1280.0, 800.0);
+    let mut rng = Rng::new(777);
+    let mut seen = [false; Boon::ALL.len()];
+    let mut saw_weapon = false;
+    for _ in 0..2000 {
+        let offer = Offer::roll(
+            &v,
+            0.0,
+            700.0,
+            AttackKind::Basic,
+            1,
+            Boons::default(),
+            0,
+            &mut rng,
+        );
+        for choice in offer.choices.iter() {
+            match choice.item {
+                OfferItem::Boon(b) => {
+                    seen[Boon::ALL.iter().position(|x| *x == b).unwrap()] = true
+                }
+                OfferItem::Attack { .. } => saw_weapon = true,
+            }
+        }
+    }
+    assert!(seen.iter().all(|s| *s), "some boon can never be drawn");
+    assert!(saw_weapon, "weapons should still share the pool");
+}
+
+/* ---------------- the modified wall ---------------- */
+
+/// A run with `wall`, one enemy planted `offset` from the player, and a charge
+/// ready to spend.
+fn wall_and_one_enemy(wall: WallMod, offset: f32) -> Game {
+    let mut game = player_with(Boons { wall, ..Default::default() });
+    let v = game.viewport;
+    game.state = State::Playing;
+    game.players[0].super_charges = 1;
+    let mut z = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    z.body.x = game.players[0].body.x + offset;
+    z.body.y = v.hper(GROUND_Y_PCT) - z.body.h;
+    z.ax = 0.0;
+    game.zombies.clear();
+    game.flyers.clear();
+    game.zombies.push(z);
+    game
+}
+
+/// One tick of jumping, which is what the slam needs to be airborne.
+fn leave_the_floor(game: &mut Game) {
+    let mut frame = idle();
+    frame.players[0].jump = true;
+    game.tick(&frame);
+}
+
+/// One tick of the slam button, which is what raises the wall.
+///
+/// Note this tick also runs the enemies, so the first step of the shove is
+/// spent inside it - a measurement taken afterwards has already missed a fifth
+/// of the distance.
+fn slam(game: &mut Game) {
+    let mut frame = idle();
+    frame.players[0].slam = true;
+    game.tick(&frame);
+}
+
+/// Raises the wall the way the game does - in the air, with the slam button.
+fn slam_up_the_wall(game: &mut Game) {
+    leave_the_floor(game);
+    slam(game);
+}
+
+/// How far the one enemy on the field is moved over `ticks`, counting from the
+/// tick the wall goes up.
+///
+/// The shove is written into the enemy's own velocity, so there is no moment it
+/// stops: it bleeds off. What can be pinned down is the distance over a window,
+/// which is what [`WALL_SHOVE_AX_PCT`] is aimed at.
+fn distance_moved_by_the_wall(game: &mut Game, flyer: bool, ticks: i32) -> f32 {
+    let read = |g: &Game| if flyer { g.flyers[0].body.x } else { g.zombies[0].body.x };
+    leave_the_floor(game);
+    let before = read(game);
+    slam(game);
+    for _ in 1..ticks {
+        game.tick(&idle());
+    }
+    read(game) - before
+}
+
+#[test]
+fn a_plain_wall_leaves_the_field_where_it_stands() {
+    // Not "ax is zero": an enemy walking toward the player has a speed of its
+    // own, and it was never the wall that gave it one.
+    let mut game = wall_and_one_enemy(WallMod::Plain, 400.0);
+    let want = game.viewport.wper(10.0);
+    let travelled = distance_moved_by_the_wall(&mut game, false, WALL_SHOVE_TICKS).abs();
+    assert!(
+        travelled < want / 4.0,
+        "an unmodified wall moved the field {travelled}"
+    );
+}
+
+#[test]
+fn a_black_wall_drags_the_field_in() {
+    let mut game = wall_and_one_enemy(WallMod::Pull, 400.0);
+    let want = game.viewport.wper(10.0);
+    let travelled = -distance_moved_by_the_wall(&mut game, false, WALL_SHOVE_TICKS);
+    assert!(
+        (travelled - want).abs() < want * 0.02,
+        "it should have come {want} closer, not {travelled}"
+    );
+}
+
+#[test]
+fn a_grey_wall_clears_the_field_out() {
+    let mut game = wall_and_one_enemy(WallMod::Push, 400.0);
+    let want = game.viewport.wper(10.0);
+    let travelled = distance_moved_by_the_wall(&mut game, false, WALL_SHOVE_TICKS);
+    assert!(
+        (travelled - want).abs() < want * 0.02,
+        "it should have been thrown {want} clear, not {travelled}"
+    );
+}
+
+#[test]
+fn the_field_is_moved_toward_or_away_whichever_side_it_is_on() {
+    // Read off the side the enemy stands on, not off which way it happens to
+    // be walking - otherwise a wall would gather half the field and scatter
+    // the rest.
+    for offset in [400.0, -400.0] {
+        let mut game = wall_and_one_enemy(WallMod::Pull, offset);
+        let gap = |g: &Game| (g.zombies[0].body.x - g.players[0].body.x).abs();
+        let before = gap(&game);
+        slam_up_the_wall(&mut game);
+        for _ in 0..WALL_SHOVE_TICKS {
+            game.tick(&idle());
+        }
+        assert!(gap(&game) < before, "an enemy at {offset} was not drawn in");
+    }
+}
+
+#[test]
+fn the_hold_is_one_shove_and_not_a_standing_force() {
+    // A lasting pull is a tractor beam and a lasting push makes the wall
+    // unapproachable. Neither is a wall.
+    let mut game = wall_and_one_enemy(WallMod::Push, 400.0);
+    slam_up_the_wall(&mut game);
+    for _ in 0..60 {
+        game.tick(&idle());
+    }
+    let after = game.zombies[0].body.x;
+    for _ in 0..20 {
+        game.tick(&idle());
+    }
+    assert!(
+        game.zombies[0].body.x < after,
+        "it should have gone back to walking in"
+    );
+}
+
+#[test]
+fn a_leaper_mid_leap_is_moved_like_everything_else() {
+    // Its trajectory takes an early exit out of the chase; the shove has to be
+    // checked before that or the one enemy hardest to catch would ignore it.
+    let mut game = wall_and_one_enemy(WallMod::Push, 300.0);
+    let v = game.viewport;
+    game.zombies[0].movement = Movement::Leap(Leap { crouch: 0, airborne: true });
+    game.zombies[0].ax = -v.wper(2.0);
+    game.zombies[0].body.y -= v.hper(20.0);
+    let before = game.zombies[0].body.x;
+
+    slam_up_the_wall(&mut game);
+    game.tick(&idle());
+    assert!(
+        game.zombies[0].body.x > before,
+        "a leaper flew through the wall's hold untouched"
+    );
+}
+
+#[test]
+fn flyers_are_field_too() {
+    let mut game = player_with(Boons { wall: WallMod::Push, ..Default::default() });
+    let v = game.viewport;
+    game.state = State::Playing;
+    game.players[0].super_charges = 1;
+    game.zombies.clear();
+    game.flyers.clear();
+    let size = game.players[0].body;
+    let mut f = Flyer::from_edge(&v, &size, 0, &mut game.rng);
+    f.body.x = game.players[0].body.x + 300.0;
+    game.flyers.push(f);
+    let want = v.wper(10.0);
+    let travelled = distance_moved_by_the_wall(&mut game, true, WALL_SHOVE_TICKS);
+    assert!(
+        (travelled - want).abs() < want * 0.02,
+        "a flyer should be thrown {want} clear, not {travelled}"
+    );
+}
+
+#[test]
+fn the_shove_coasts_rather_than_stopping_dead() {
+    // Living in the enemy's own velocity means there is no tick it ends on. The
+    // window the constant is aimed at is the first five; after that it keeps
+    // going, more slowly, for about another fifteen.
+    let mut game = wall_and_one_enemy(WallMod::Push, 400.0);
+    let v = game.viewport;
+    let five = distance_moved_by_the_wall(&mut game, false, WALL_SHOVE_TICKS);
+    let mut game = wall_and_one_enemy(WallMod::Push, 400.0);
+    let twenty = distance_moved_by_the_wall(&mut game, false, 20);
+    assert!(
+        twenty > five * 2.0,
+        "it should still be travelling after the window: {five} then {twenty}"
+    );
+    assert!(
+        twenty < v.wper(30.0),
+        "but a third of the view would be a launch, not a shove"
+    );
+}
+
+#[test]
+fn a_shoved_flyer_goes_back_to_cruising() {
+    // Nothing in a flyer's own update ever lowers its speed, so without the
+    // bleed-off the shove would become the speed it keeps for good.
+    let mut game = player_with(Boons { wall: WallMod::Push, ..Default::default() });
+    let v = game.viewport;
+    game.state = State::Playing;
+    game.players[0].super_charges = 1;
+    game.zombies.clear();
+    game.flyers.clear();
+    let size = game.players[0].body;
+    let mut f = Flyer::from_edge(&v, &size, 0, &mut game.rng);
+    f.body.x = game.players[0].body.x + 300.0;
+    game.flyers.push(f);
+
+    slam_up_the_wall(&mut game);
+    assert!(game.flyers[0].ax.abs() > v.wper(FLYER_CRUISE_PCT));
+    for _ in 0..60 {
+        game.tick(&idle());
+    }
+    assert!(
+        game.flyers[0].ax.abs() <= v.wper(FLYER_CRUISE_PCT) + 0.01,
+        "a shoved flyer kept the speed for good: {}",
+        game.flyers[0].ax
+    );
+}
+
+#[test]
+fn nothing_moving_at_its_own_pace_is_touched_by_the_bleed_off() {
+    // The deceleration only ever applies above cruising speed, so an ordinary
+    // flyer crosses the screen exactly as it always did.
+    let mut game = new_game();
+    let v = game.viewport;
+    game.state = State::Playing;
+    game.zombies.clear();
+    game.flyers.clear();
+    let size = Body::new(0.0, 0.0, v.wper(5.0), v.hper(10.0));
+    game.flyers.push(Flyer::from_edge(&v, &size, 0, &mut game.rng));
+    let cruise = game.flyers[0].ax;
+    for _ in 0..30 {
+        game.tick(&idle());
+    }
+    assert_eq!(game.flyers[0].ax, cruise, "cruising speed should be left alone");
+}
+
+#[test]
+fn the_two_walls_replace_each_other() {
+    // A wall cannot pull and push at once, so they are one setting. That also
+    // means the offer keeps showing the other one, which is the swap.
+    let mut boons = Boons::default();
+    boons.take(Boon::WallPull);
+    assert_eq!(boons.wall, WallMod::Pull);
+    assert!(boons.has(Boon::WallPull) && !boons.has(Boon::WallPush));
+
+    boons.take(Boon::WallPush);
+    assert_eq!(boons.wall, WallMod::Push);
+    assert!(boons.has(Boon::WallPush) && !boons.has(Boon::WallPull));
+}
+
+#[test]
+fn holding_one_wall_leaves_the_other_on_the_table() {
+    let v = Viewport::new(1280.0, 800.0);
+    let mut rng = Rng::new(9001);
+    let held = Boons {
+        double_jump: true,
+        dash_free: true,
+        shield: true,
+        wall: WallMod::Pull,
+    };
+    let mut saw_push = false;
+    for _ in 0..500 {
+        let offer = Offer::roll(&v, 0.0, 700.0, AttackKind::Basic, 1, held, 0, &mut rng);
+        for choice in offer.choices.iter() {
+            if let OfferItem::Boon(b) = choice.item {
+                assert_ne!(b, Boon::WallPull, "the wall it already has was offered");
+                saw_push = true;
+            }
+        }
+    }
+    assert!(saw_push, "the other wall should still come up as a swap");
+}
+
+#[test]
+fn each_wall_is_a_flat_slab_of_its_own_shade() {
+    // Three shades far enough apart to be told apart at a glance, and nothing
+    // else: no outline, so the colour carries the whole warning.
+    let shades = [WallMod::Plain, WallMod::Pull, WallMod::Push].map(|w| w.color().r);
+    assert!(shades[0] > 200.0, "the plain wall should be white");
+    assert!(shades[1] < 32.0, "the pulling wall should be black");
+    assert!(shades[2] > 100.0 && shades[2] < 200.0, "the pushing wall should be grey");
+    for pair in [(0, 1), (1, 2), (0, 2)] {
+        let gap = (shades[pair.0] - shades[pair.1]).abs();
+        assert!(gap > 90.0, "two walls are only {gap} apart");
+    }
+}
+
 /* ---------------- the offer between waves ---------------- */
 
 /// Ticks until the standing options accept a hit.
@@ -4223,9 +5841,13 @@ fn the_three_options_are_all_different() {
     into_the_lull(&mut game);
 
     let c = &game.offer.as_ref().unwrap().choices;
-    assert!(c[0].kind != c[1].kind && c[1].kind != c[2].kind && c[0].kind != c[2].kind);
+    assert!(c[0].item != c[1].item && c[1].item != c[2].item && c[0].item != c[2].item);
     for choice in c.iter() {
-        assert_ne!(choice.kind, AttackKind::Basic, "the plain attack is not an upgrade");
+        assert_ne!(
+            choice.item,
+            OfferItem::Attack { kind: AttackKind::Basic, level: 1 },
+            "the plain attack is not an upgrade"
+        );
     }
 }
 
@@ -4283,8 +5905,15 @@ fn hitting_an_option_arms_every_player() {
 
     assert!(game.offer.is_none(), "taking one clears the rest");
     for p in game.players.iter() {
-        assert_eq!(p.attack, taken.kind, "both players should be carrying it");
-        assert_eq!(p.attack_level, taken.level);
+        match taken.item {
+            OfferItem::Attack { kind, level } => {
+                assert_eq!(p.attack, kind, "both players should be carrying it");
+                assert_eq!(p.attack_level, level);
+            }
+            OfferItem::Boon(boon) => {
+                assert!(p.boons.has(boon), "both players should have been given it");
+            }
+        }
     }
 }
 

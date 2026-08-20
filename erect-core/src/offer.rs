@@ -9,7 +9,10 @@
 //! total, which is also what drives the chase speed - so upgrades and difficulty
 //! run off the same clock.
 
+use alloc::string::{String, ToString};
+
 use crate::attack::{AttackKind, MAX_LEVEL};
+use crate::boon::{Boon, Boons};
 use crate::entities::Rng;
 use crate::geom::{Body, Viewport};
 
@@ -31,19 +34,50 @@ pub const OFFER_ARM_TICKS: i64 = 90;
 /// reaching one is a decision rather than an accident of where you stopped.
 const OFFER_X_PCT: [f32; OFFER_CHOICES] = [25.0, 50.0, 75.0];
 
+/// What one of the three standing options would give.
+///
+/// Weapons and boons share the pool rather than alternating. A boon is the
+/// safer pick whenever one is on the table - it is kept, and it costs no level
+/// - but there are only three of them and a taken one never returns, so the
+/// pool drains back to weapons on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfferItem {
+    Attack {
+        kind: AttackKind,
+        /// What the player would end up carrying - a fresh 1, or one more of
+        /// what they already have.
+        level: u8,
+    },
+    Boon(Boon),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct OfferChoice {
-    pub kind: AttackKind,
-    /// What the player would end up carrying - a fresh 1, or one more of what
-    /// they already have.
-    pub level: u8,
+    pub item: OfferItem,
     pub body: Body,
 }
 
 impl OfferChoice {
-    /// True when this is another level of what the player is already holding.
+    /// True when this is another level of the weapon already being held.
     pub fn is_upgrade(&self, current: AttackKind) -> bool {
-        self.kind == current
+        matches!(self.item, OfferItem::Attack { kind, .. } if kind == current)
+    }
+
+    /// What the option says above its head.
+    ///
+    /// A level is only worth printing when it is a step up from what is already
+    /// carried; on a fresh weapon it would just read as noise.
+    pub fn label(&self, current: AttackKind) -> String {
+        match self.item {
+            OfferItem::Attack { kind, level } if kind == current => {
+                let mut text = kind.label().to_string();
+                text.push(' ');
+                text.push((b'0' + level) as char);
+                text
+            }
+            OfferItem::Attack { kind, .. } => kind.label().to_string(),
+            OfferItem::Boon(boon) => boon.label().to_string(),
+        }
     }
 }
 
@@ -61,11 +95,13 @@ impl Offer {
         timer >= self.live_from
     }
 
-    /// Draws three distinct options for a player carrying `current` at `level`.
+    /// Draws three distinct options for a player carrying `current` at `level`
+    /// and holding `held`.
     ///
-    /// The pool is every kind they are not holding, plus one more level of the
-    /// one they are - so a run can deepen a weapon instead of only swapping it,
-    /// and a maxed-out weapon quietly stops being offered.
+    /// The pool is every weapon they are not holding, plus one more level of
+    /// the one they are - so a run can deepen a weapon instead of only swapping
+    /// it, and a maxed-out weapon quietly stops being offered - plus every boon
+    /// not already taken.
     #[allow(clippy::too_many_arguments)]
     pub fn roll(
         v: &Viewport,
@@ -73,19 +109,29 @@ impl Offer {
         ground_y: f32,
         current: AttackKind,
         level: u8,
+        held: Boons,
         timer: i64,
         rng: &mut Rng,
     ) -> Self {
-        // At most the whole roster plus the level-up, so a fixed array does.
-        let mut pool = [(AttackKind::Basic, 1u8); AttackKind::ALL.len() + 1];
+        // At most the whole roster, the level-up and every boon, so a fixed
+        // array does.
+        let mut pool =
+            [OfferItem::Attack { kind: AttackKind::Basic, level: 1 };
+                AttackKind::ALL.len() + 1 + Boon::ALL.len()];
         let mut n = 0;
         if current != AttackKind::Basic && level < MAX_LEVEL {
-            pool[n] = (current, level + 1);
+            pool[n] = OfferItem::Attack { kind: current, level: level + 1 };
             n += 1;
         }
         for kind in AttackKind::ALL {
             if kind != current {
-                pool[n] = (kind, 1);
+                pool[n] = OfferItem::Attack { kind, level: 1 };
+                n += 1;
+            }
+        }
+        for boon in Boon::ALL {
+            if !held.has(boon) {
+                pool[n] = OfferItem::Boon(boon);
                 n += 1;
             }
         }
@@ -100,15 +146,13 @@ impl Offer {
         let w = v.wper(5.0);
         let h = v.hper(10.0);
         let mut choices = [OfferChoice {
-            kind: AttackKind::Basic,
-            level: 1,
+            item: OfferItem::Attack { kind: AttackKind::Basic, level: 1 },
             body: Body::default(),
         }; OFFER_CHOICES];
         for (i, choice) in choices.iter_mut().enumerate() {
-            let (kind, level) = pool[i.min(n.saturating_sub(1))];
+            let item = pool[i.min(n.saturating_sub(1))];
             *choice = OfferChoice {
-                kind,
-                level,
+                item,
                 body: Body::new(
                     camera_x + v.wper(OFFER_X_PCT[i]) - w / 2.0,
                     ground_y - h,

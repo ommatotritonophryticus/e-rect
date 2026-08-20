@@ -8,16 +8,28 @@ edition.workspace = true
 name = "erect"
 path = "src/main.rs"
 
+[features]
+# An unattended run that saves what it drew. Never in a shipped build: it exists
+# so a change to the renderer can be checked without a person at the keyboard.
+harness = []
+
 [dependencies]
 erect-core = { path = "../erect-core" }
 erect-audio = { path = "../erect-audio" }
-# 2D rendering + windowing + keyboard. No system libraries on Windows/macOS,
-# only the usual X11/GL ones on Linux.
+# 2D rendering, windowing, keyboard and touch. No system libraries on
+# Windows/macOS, only the usual X11/GL ones on Linux - and it targets
+# wasm32-unknown-unknown, which is what makes the browser build possible at all.
 macroquad = "0.4"
-# Cross-platform gamepads: XInput on Windows, evdev on Linux, IOKit on macOS.
-gilrs = "0.11"
+
+# Everything below wants an operating system. A browser has none of it: no
+# device enumeration, no gamepad subsystem, no filesystem. The build is silent
+# there and the settings live only as long as the tab does.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Only the on-disk settings format needs these.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Cross-platform gamepads: XInput on Windows, evdev on Linux, IOKit on macOS.
+gilrs = "0.11"
 # Per-OS config directory for the settings file.
 directories = "5"
 # Own mixer + raw device access: six layers must stay sample-locked, which

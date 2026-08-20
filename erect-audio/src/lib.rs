@@ -58,14 +58,14 @@ pub mod packs {
         pub sfx: [(&'static str, usize, f32, f32); 3],
     }
 
-    /// Both packs ship the same three sounds; only the music differs.
+    /// Every pack ships the same three sounds; only the music differs.
     const SFX: [(&str, usize, f32, f32); 3] = [
         ("hit", 4, 40.0, -15.36),
         ("jump", 2, 60.0, -7.82),
         ("down", 3, 60.0, -12.52),
     ];
 
-    pub static PACKS: [Pack; 2] = [
+    pub static PACKS: [Pack; 3] = [
         Pack {
             dir: "pack1",
             loop_samples: 991232,
@@ -78,6 +78,13 @@ pub mod packs {
             loop_samples: 1088640,
             desktop_gains_db: [0.0; 6],
             psp_gains_db: [-10.80, -18.59, -12.17, -10.20, -11.92, -17.63],
+            sfx: SFX,
+        },
+        Pack {
+            dir: "pack3",
+            loop_samples: 991232,
+            desktop_gains_db: [0.0; 6],
+            psp_gains_db: [-17.04, -31.26, -12.37, -5.30, -24.13, -12.43],
             sfx: SFX,
         },
     ];
