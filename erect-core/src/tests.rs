@@ -11,6 +11,9 @@ use crate::boon::{Boon, Boons, WallMod, SHIELD_COOLDOWN_TICKS};
 use crate::config::{
     boss_hp, elite_group_size, elites_in_wave as elite_count, wave_budget, ROLLED_BOSS_WAVE,
 };
+use crate::color::Rgb;
+use crate::recipe::marks as recipe_marks;
+use crate::recipe::MAX_MARKS;
 use crate::waves::BossKind;
 use crate::entities::Reach;
 use crate::offer::{Offer, OfferItem, OFFER_ARM_TICKS, OFFER_SCORE_STEP};
@@ -6519,4 +6522,111 @@ fn a_rolled_boss_is_announced_as_what_it_actually_is() {
         assert!(label.contains("BROOD"), "the name hides the brood: {label}");
         assert!(!label.contains("TRAP"), "the name promises a hazard: {label}");
     }
+}
+
+/* ---------------- the bands ---------------- */
+
+#[test]
+fn the_bands_and_the_name_say_the_same_thing() {
+    // The stripes are the announcement drawn instead of written, and they go on
+    // saying it after the name has faded. A trait in one and not the other
+    // would make them two different claims about the same enemy.
+    let mut rng = Rng::new(20260822);
+    let mut marks = [Rgb::new(0.0, 0.0, 0.0); MAX_MARKS];
+    for _ in 0..500 {
+        let recipe = Recipe::roll(40, &mut rng);
+        let words = recipe.label().split_whitespace().count();
+        let bands = recipe.marks(&mut marks);
+        assert_eq!(bands, words, "{} reads as {words} and draws as {bands}", recipe.label());
+        assert!(bands >= 1 && bands <= MAX_MARKS);
+    }
+}
+
+#[test]
+fn the_band_order_follows_the_name() {
+    // Size, then how it moves, then what it does - the order the name reads in.
+    let recipe = Recipe {
+        size: Size::Large,
+        movement: MoveKind::Leap,
+        shoot: true,
+        blink: false,
+        shed: false,
+        brood: true,
+    };
+    let mut marks = [Rgb::new(0.0, 0.0, 0.0); MAX_MARKS];
+    let n = recipe.marks(&mut marks);
+    assert_eq!(recipe.label(), "HUGE LEAPER GUN BROOD");
+    assert_eq!(n, 4);
+    assert_eq!(
+        &marks[..4],
+        &[recipe_marks::HUGE, recipe_marks::LEAPER, recipe_marks::GUN, recipe_marks::BROOD]
+    );
+
+    // The ordinary size has no word and no band, the same absence twice.
+    let plain = Recipe { size: Size::Normal, ..recipe };
+    assert_eq!(plain.marks(&mut marks), 3);
+    assert_eq!(marks[0], recipe_marks::LEAPER);
+}
+
+#[test]
+fn no_two_marks_can_be_mistaken_for_each_other_or_for_the_ground() {
+    // Eyeballed sets kept putting a blue next to the lull sky. This is the
+    // measurement that stopped that, kept so a future edit has to face it too.
+    let marks = [
+        recipe_marks::HUGE,
+        recipe_marks::SMALL,
+        recipe_marks::SLIGHT,
+        recipe_marks::RUNNER,
+        recipe_marks::HOPPER,
+        recipe_marks::LEAPER,
+        recipe_marks::FLIER,
+        recipe_marks::GUN,
+        recipe_marks::BLINK,
+        recipe_marks::TRAP,
+        recipe_marks::BROOD,
+    ];
+    // Weighted so green counts for more than blue, roughly as an eye does.
+    let apart = |a: Rgb, b: Rgb| {
+        let rm = (a.r + b.r) / 2.0;
+        let (dr, dg, db) = (a.r - b.r, a.g - b.g, a.b - b.b);
+        libm::sqrtf((2.0 + rm / 256.0) * dr * dr + 4.0 * dg * dg
+            + (2.0 + (255.0 - rm) / 256.0) * db * db)
+    };
+    for (i, a) in marks.iter().enumerate() {
+        for b in marks.iter().skip(i + 1) {
+            assert!(apart(*a, *b) > 150.0, "{a:?} and {b:?} are too close");
+        }
+        // Against the body it is drawn on and everything behind it.
+        for ground in [
+            ELITE_COLOR,
+            Rgb::new(240.0, 50.0, 20.0),
+            Rgb::new(80.0, 170.0, 255.0),
+            Rgb::new(80.0, 255.0, 130.0),
+            Rgb::new(0.0, 0.0, 0.0),
+        ] {
+            assert!(apart(*a, ground) > 150.0, "{a:?} vanishes on {ground:?}");
+        }
+    }
+}
+
+#[test]
+fn only_the_heavies_are_banded() {
+    // Young wear the same shade as the parent and are left flat. That is the
+    // difference the player needs at a glance: the striped one is the one worth
+    // the swings.
+    let mut game = new_game();
+    let v = game.viewport;
+    let recipe = Recipe {
+        movement: MoveKind::Run,
+        size: Size::Normal,
+        shoot: false,
+        blink: false,
+        shed: false,
+        brood: true,
+    };
+    let heavy = recipe.build(&v, 20, 0, &mut game.rng);
+    let minion = recipe.build_minion(&v, 0, &mut game.rng);
+    assert!(heavy.elite && heavy.recipe.is_some(), "a heavy carries what it was rolled from");
+    assert!(!minion.elite && !minion.is_boss, "and a minion is neither");
+    assert_eq!(heavy.color, minion.color, "but they share a shade");
 }

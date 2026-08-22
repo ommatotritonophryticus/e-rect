@@ -21,6 +21,13 @@ pub struct Harness {
     /// frame number cannot catch that: when it arrives depends on how fast the
     /// wave spent its budget.
     on_elite: Option<String>,
+    /// Frames to wait after a heavy is announced before saving.
+    ///
+    /// Enemies are placed just outside the view and walk in, so the frame a
+    /// heavy is announced on is the one frame it is guaranteed *not* to be
+    /// visible in. Three attempts at photographing one went that way.
+    on_elite_delay: u32,
+    on_elite_at: Option<u32>,
     /// Keeps the players standing. Nothing drives them here, so an ordinary run
     /// ends within a wave or two - long before the thing under test arrives.
     keep_alive: bool,
@@ -45,6 +52,7 @@ impl Harness {
         let mut frames = 600;
         let mut shots = Vec::new();
         let mut on_elite = None;
+        let mut on_elite_delay = 0u32;
         let mut keep_alive = false;
         let mut fight = false;
         let mut boons = false;
@@ -64,7 +72,13 @@ impl Harness {
                         shots.push((at.parse().unwrap_or(0), path.to_string()));
                     }
                 }
-                "on_elite" => on_elite = Some(value.to_string()),
+                "on_elite" => match value.split_once(':') {
+                    Some((delay, path)) => {
+                        on_elite_delay = delay.parse().unwrap_or(0);
+                        on_elite = Some(path.to_string());
+                    }
+                    None => on_elite = Some(value.to_string()),
+                },
                 "alive" => keep_alive = true,
                 "fight" => fight = true,
                 "boons" => boons = true,
@@ -97,7 +111,16 @@ impl Harness {
                 p.super_charges = 9;
             }
         }
-        Some(Self { frames, shots, on_elite, keep_alive, fight, wall: wall != erect_core::boon::WallMod::Plain })
+        Some(Self {
+            frames,
+            shots,
+            on_elite,
+            on_elite_delay,
+            on_elite_at: None,
+            keep_alive,
+            fight,
+            wall: wall != erect_core::boon::WallMod::Plain,
+        })
     }
 
     /// True when the run is over and the process should stop.
@@ -154,11 +177,14 @@ impl Harness {
     }
 
     pub fn after_frame(&mut self, frame: u32, game: &Game) -> bool {
-        if let Some(path) = self.on_elite.as_ref() {
-            if game.elite_notice().is_some() {
-                get_screen_data().export_png(path);
-                println!("harness: frame {frame} (heavy announced) -> {path}");
-                self.on_elite = None;
+        if self.on_elite.is_some() {
+            if self.on_elite_at.is_none() && game.elite_notice().is_some() {
+                self.on_elite_at = Some(frame + self.on_elite_delay);
+            }
+            if self.on_elite_at.is_some_and(|due| frame >= due) {
+                let path = self.on_elite.take().unwrap();
+                get_screen_data().export_png(&path);
+                println!("harness: frame {frame} (heavy, +{} frames) -> {path}", self.on_elite_delay);
             }
         }
         while let Some((at, path)) = self.shots.first() {

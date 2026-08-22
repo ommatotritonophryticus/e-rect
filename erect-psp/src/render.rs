@@ -6,6 +6,7 @@
 
 use alloc::format;
 use erect_core::color::Rgb;
+use erect_core::recipe::MAX_MARKS;
 use erect_core::config::*;
 use erect_core::game::{Game, RunResult, State};
 use erect_core::geom::Body;
@@ -195,6 +196,33 @@ unsafe fn actor(body: &Body, color: u32, outline_w: f32, outline_h: f32) {
     }
 }
 
+/// See the desktop renderer: a rolled enemy is banded a colour per trait,
+/// because a combination cannot be named by a single one.
+unsafe fn enemy(body: &Body, z: &erect_core::entities::Zombie, ow: f32, oh: f32) {
+    unsafe {
+        let shade = z.hp / z.hpmax;
+        let mut marks = [Rgb::new(0.0, 0.0, 0.0); MAX_MARKS];
+        let count = match (z.elite || z.is_boss, z.recipe.as_ref()) {
+            (true, Some(recipe)) => recipe.marks(&mut marks),
+            _ => 0,
+        };
+        actor(body, gfx::pack(z.color.shaded(shade)), ow, oh);
+        if count == 0 {
+            return;
+        }
+        let step = body.h / count as f32;
+        for (i, mark) in marks.iter().take(count).enumerate() {
+            let top = body.y + step * i as f32;
+            let bottom = if i + 1 == count {
+                body.y + body.h
+            } else {
+                body.y + step * (i + 1) as f32
+            };
+            gfx::rect(body.x, top, body.w, bottom - top, gfx::pack(mark.shaded(shade)));
+        }
+    }
+}
+
 unsafe fn render_session(game: &Game) {
     unsafe {
         let v = &game.viewport;
@@ -289,7 +317,7 @@ unsafe fn render_session(game: &Game) {
                 }
             }
             for z in game.zombies.iter() {
-                actor(&on_screen(&z.body, cam), gfx::pack(z.color.shaded(z.hp / z.hpmax)), ow, oh);
+                enemy(&on_screen(&z.body, cam), z, ow, oh);
             }
             for f in game.flyers.iter() {
                 actor(&on_screen(&f.body, cam), gfx::pack(f.color.shaded(f.hp / f.hpmax)), ow, oh);

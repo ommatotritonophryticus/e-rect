@@ -257,7 +257,7 @@ when you move.
 cargo test
 ```
 
-Runs on the host and covers `erect-core` and `erect-audio` — 272 tests. The
+Runs on the host and covers `erect-core` and `erect-audio` — 277 tests. The
 frontends are mostly not covered; drawing is the part a test cannot see.
 
 `erect-psp` is excluded from the workspace, because it only builds for
@@ -283,6 +283,7 @@ with `ERECT_HARNESS` set, comma separated:
 | `out=PATH` | save a PNG at the end |
 | `at=N:PATH` | save one at frame `N` |
 | `on_elite=PATH` | save the frame a rolled heavy is announced |
+| `on_elite=N:PATH` | save `N` frames after that - enemies enter from outside the view, so the frame one is announced on is the one frame it is not visible in |
 | `alive` | keep the players standing |
 | `boons` | hand the players every standing upgrade |
 | `screen=dev\|title` | open that menu instead of playing, to look at a layout |

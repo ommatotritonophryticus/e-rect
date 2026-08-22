@@ -3,6 +3,7 @@
 //! positions.
 
 use erect_core::color::Rgb;
+use erect_core::recipe::MAX_MARKS;
 use erect_core::config::*;
 use erect_core::game::{Game, RunResult, State};
 use erect_core::geom::{Body, Viewport};
@@ -194,6 +195,45 @@ impl Renderer {
         self.draw_centered(&v, "NO SOUND THIS TIME", 46.0, v.hper(5.0), WHITE);
         self.draw_centered(&v, why, 54.0, v.hper(3.2), GREY_TEXT);
         self.draw_centered(&v, "STARTING ANYWAY", 64.0, v.hper(4.0), GREY_TEXT);
+    }
+
+    /// One enemy, banded if it was rolled rather than picked off the roster.
+    ///
+    /// A rolled enemy is a combination, and a combination cannot be named by a
+    /// single colour. So the body is split into a band per trait, in the order
+    /// the announcement reads them: the stripes and the name say the same thing,
+    /// and the stripes go on saying it after the name has faded.
+    ///
+    /// Only the heavies are banded. Their young wear the same shade and are
+    /// left flat, which is the difference the player needs at a glance: the
+    /// striped one is the one worth the swings.
+    fn draw_enemy(&self, v: &Viewport, body: &Body, z: &erect_core::entities::Zombie) {
+        let shade = z.hp / z.hpmax;
+        let marked = z.elite || z.is_boss;
+        let mut marks = [Rgb::new(0.0, 0.0, 0.0); MAX_MARKS];
+        let count = match (marked, z.recipe.as_ref()) {
+            (true, Some(recipe)) => recipe.marks(&mut marks),
+            _ => 0,
+        };
+        if count == 0 {
+            self.draw_actor(v, body, mq(z.color.shaded(shade)));
+            return;
+        }
+        // The outline and the base first, so a band that rounds short of the
+        // bottom edge shows the body rather than the sky.
+        self.draw_actor(v, body, mq(z.color.shaded(shade)));
+        let step = body.h / count as f32;
+        for (i, mark) in marks.iter().take(count).enumerate() {
+            let top = body.y + step * i as f32;
+            // The last band is drawn to the body's own edge rather than to its
+            // own height, so rounding cannot leave a seam of base colour.
+            let bottom = if i + 1 == count {
+                body.y + body.h
+            } else {
+                body.y + step * (i + 1) as f32
+            };
+            draw_rectangle(body.x, top, body.w, bottom - top, mq(mark.shaded(shade)));
+        }
     }
 
     pub fn render(&self, game: &Game, pads_connected: [bool; MAX_PLAYERS]) {
@@ -426,7 +466,7 @@ impl Renderer {
                 }
             }
             for z in game.zombies.iter() {
-                self.draw_actor(v, &on_screen(&z.body, cam), mq(z.color.shaded(z.hp / z.hpmax)));
+                self.draw_enemy(v, &on_screen(&z.body, cam), z);
             }
             for f in game.flyers.iter() {
                 self.draw_actor(v, &on_screen(&f.body, cam), mq(f.color.shaded(f.hp / f.hpmax)));

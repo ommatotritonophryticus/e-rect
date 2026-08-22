@@ -38,6 +38,39 @@ pub const ELITE_REWARD_PER_WAVE: i64 = 50;
 /// shade no ordinary enemy wears, and the name it is announced under.
 pub const ELITE_COLOR: Rgb = Rgb::new(64.0, 64.0, 88.0);
 
+/// One colour per trait, for the bands a rolled enemy is drawn in.
+///
+/// A rolled enemy has no signature colour, because it is a combination and a
+/// combination has nothing to say in a language of ten fixed hues. So it says
+/// it in several: the body is split into a band per trait, in the same order
+/// the name reads, and the bands and the name are the same sentence twice.
+///
+/// The eleven were picked by measuring rather than by eye - every pair is at
+/// least 184 apart in a weighted RGB distance, and every one of them at least
+/// 169 from the enemy's own body colour, from black, and from all three
+/// backgrounds. Eyeballed sets kept putting a blue next to the lull sky.
+pub mod marks {
+    use crate::color::Rgb;
+
+    pub const HUGE: Rgb = Rgb::new(255.0, 255.0, 255.0);
+    pub const SMALL: Rgb = Rgb::new(128.0, 128.0, 128.0);
+    pub const SLIGHT: Rgb = Rgb::new(176.0, 196.0, 222.0);
+
+    pub const RUNNER: Rgb = Rgb::new(0.0, 200.0, 90.0);
+    pub const HOPPER: Rgb = Rgb::new(0.0, 225.0, 225.0);
+    pub const LEAPER: Rgb = Rgb::new(0.0, 0.0, 240.0);
+    pub const FLIER: Rgb = Rgb::new(176.0, 0.0, 240.0);
+
+    pub const GUN: Rgb = Rgb::new(255.0, 175.0, 0.0);
+    pub const BLINK: Rgb = Rgb::new(250.0, 245.0, 110.0);
+    pub const TRAP: Rgb = Rgb::new(255.0, 95.0, 175.0);
+    pub const BROOD: Rgb = Rgb::new(128.0, 224.0, 0.0);
+}
+
+/// Most bands a rolled enemy can carry: a size, a way of moving and four
+/// behaviours.
+pub const MAX_MARKS: usize = 6;
+
 /// Chance each behaviour is rolled in. Independent, so a plain elite - heavy
 /// and nothing else - is a perfectly ordinary outcome.
 const BEHAVIOUR_CHANCE: f32 = 0.45;
@@ -224,6 +257,45 @@ impl Recipe {
     ///
     /// Movement first because it is what the player reads first - the thing is
     /// across the field before its tricks show.
+    /// The colours to band the body with, in the order the name reads.
+    ///
+    /// Returns how many were written rather than a vector: this is asked for
+    /// once per enemy per frame, on a console with no allocator to spare.
+    pub fn marks(&self, out: &mut [Rgb; MAX_MARKS]) -> usize {
+        let mut n = 0;
+        let mut push = |c: Rgb, n: &mut usize| {
+            out[*n] = c;
+            *n += 1;
+        };
+        match self.size {
+            Size::Large => push(marks::HUGE, &mut n),
+            Size::Small => push(marks::SMALL, &mut n),
+            Size::Flyer => push(marks::SLIGHT, &mut n),
+            // The ordinary size is the one the name leaves out too.
+            Size::Normal => {}
+        }
+        push(
+            match self.movement {
+                MoveKind::Run => marks::RUNNER,
+                MoveKind::Hop => marks::HOPPER,
+                MoveKind::Leap => marks::LEAPER,
+                MoveKind::Fly => marks::FLIER,
+            },
+            &mut n,
+        );
+        for (on, colour) in [
+            (self.shoot, marks::GUN),
+            (self.blink, marks::BLINK),
+            (self.shed, marks::TRAP),
+            (self.brood, marks::BROOD),
+        ] {
+            if on {
+                push(colour, &mut n);
+            }
+        }
+        n
+    }
+
     pub fn label(&self) -> alloc::string::String {
         use alloc::string::ToString;
         let mut out = alloc::string::String::new();
@@ -290,6 +362,7 @@ impl Recipe {
             z.max_husks = SHEDDER_HUSKS;
         }
         z.broods = self.brood;
+        z.recipe = Some(*self);
         z
     }
 

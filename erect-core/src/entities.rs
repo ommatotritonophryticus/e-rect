@@ -552,6 +552,9 @@ pub struct Zombie {
     pub elite: bool,
     /// Answers every blow it survives with young. Never set on the young.
     pub broods: bool,
+    /// What this was rolled from, for the renderers to band the body with.
+    /// `None` on everything off the fixed roster, which has its own colours.
+    pub recipe: Option<crate::recipe::Recipe>,
     /// What killing it pays. Carried rather than derived, so how tough a thing
     /// is and what it is worth can be set apart from each other.
     pub reward: i64,
@@ -606,6 +609,7 @@ impl Zombie {
             is_boss: false,
             elite: false,
             broods: false,
+            recipe: None,
             reward: 6,
             armor: 1.0,
             splits_into: 0,
