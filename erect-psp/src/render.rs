@@ -384,7 +384,10 @@ unsafe fn render_hud(game: &Game) {
             v.hper(9.6),
             size,
             WHITE,
-            &format!("W:{} K:{}/{}", game.wave, p.kills, game.wave * 10),
+            &match game.wave_kill_target() {
+                Some(target) => format!("W:{} K:{}/{}", game.wave, p.kills, target),
+                None => format!("W:{} K:{}", game.wave, p.kills),
+            },
         );
 
         let charges = format!("x{}", p.super_charges);

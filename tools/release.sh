@@ -12,6 +12,12 @@
 # then depend on Debian 12's glibc rather than on whatever the host happens to
 # have, and the Windows one is linked by a pinned mingw.
 #
+# ERECT_NATIVE=1 skips the container and builds with the host's own cargo. That
+# is for CI, where the runner *is* the target machine and already pins its own
+# image - a container inside it would only add a layer and a download. It is a
+# poor idea on a workstation, where what the binary ends up requiring is
+# whatever happened to be installed.
+#
 # Everything lands in dist/ as a directory plus a zip of it.
 
 set -euo pipefail
@@ -63,10 +69,28 @@ stage_desktop() {
 }
 
 # zip_stage <stage-dir> <zip-path>
+#
+# `zip` is not on a GitHub Windows runner, and 7-Zip is not on much else, so
+# whichever is there does the job. Python is the last resort and is on every
+# runner and every developer machine this repository already needs one on.
 zip_stage() {
     local stage=$1 out=$2
     rm -f "$out"
-    ( cd "$stage" && zip -q -r -X "$out" . )
+    if command -v zip >/dev/null 2>&1; then
+        ( cd "$stage" && zip -q -r -X "$out" . )
+    elif command -v 7z >/dev/null 2>&1; then
+        ( cd "$stage" && 7z a -tzip -bso0 -bsp0 "$out" . >/dev/null )
+    else
+        ( cd "$stage" && python3 -c '
+import os, sys, zipfile
+out = sys.argv[1]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk("."):
+        for f in sorted(files):
+            path = os.path.join(root, f)
+            z.write(path, os.path.relpath(path, "."))
+' "$out" )
+    fi
     printf '  %s (%s)\n' "$(basename "$out")" "$(du -h "$out" | cut -f1)"
 }
 
@@ -130,6 +154,13 @@ build_macos() {
     zip_stage "$stage" "$DIST/erect-macos.zip"
 }
 
+# Builds for <rust-target> on the host, and answers where the binary landed.
+host_build() {
+    local target=$1
+    ( cd "$ROOT" && cargo build --release -p erect-desktop --target "$target" )
+    printf '%s' "$ROOT/target/$target/release"
+}
+
 build_linux() {
     local arch=$1 platform target
     case "$arch" in
@@ -137,22 +168,38 @@ build_linux() {
         aarch64) platform=linux/arm64; target=aarch64-unknown-linux-gnu ;;
         *) die "unknown Linux arch: $arch" ;;
     esac
-    say "Linux $arch (container)"
-    docker_build "$platform" "$target" "linux-$arch"
+    local built
+    if [ "${ERECT_NATIVE:-}" = 1 ]; then
+        say "Linux $arch (host)"
+        built=$(host_build "$target")
+    else
+        say "Linux $arch (container)"
+        docker_build "$platform" "$target" "linux-$arch"
+        built="$ROOT/$DOCKER_TARGET/linux-$arch/$target/release"
+    fi
     local stage="$DIST/erect-linux-$arch"
-    stage_desktop "$stage" "$ROOT/$DOCKER_TARGET/linux-$arch/$target/release/erect" \
+    stage_desktop "$stage" "$built/erect" \
         "$ROOT/tools/dist-readme/linux-$arch.txt" erect
     zip_stage "$stage" "$DIST/erect-linux-$arch.zip"
 }
 
 build_windows() {
-    say "Windows x86_64 (container, mingw)"
-    # Built on whatever the host's native platform is: this is a cross-compile
-    # either way, so there is nothing to gain from emulating x86 to do it.
-    docker_build "" x86_64-pc-windows-gnu windows
+    local built
+    if [ "${ERECT_NATIVE:-}" = 1 ]; then
+        # A Windows runner builds with MSVC, not mingw. Same binary to a player;
+        # the only reason the container uses mingw is that it is not Windows.
+        say "Windows x86_64 (host)"
+        built=$(host_build x86_64-pc-windows-msvc)
+    else
+        say "Windows x86_64 (container, mingw)"
+        # Built on whatever the host's native platform is: this is a
+        # cross-compile either way, so there is nothing to gain from emulating
+        # x86 to do it.
+        docker_build "" x86_64-pc-windows-gnu windows
+        built="$ROOT/$DOCKER_TARGET/windows/x86_64-pc-windows-gnu/release"
+    fi
     local stage="$DIST/erect-windows"
-    stage_desktop "$stage" \
-        "$ROOT/$DOCKER_TARGET/windows/x86_64-pc-windows-gnu/release/erect.exe" \
+    stage_desktop "$stage" "$built/erect.exe" \
         "$ROOT/tools/dist-readme/windows.txt" erect.exe
     zip_stage "$stage" "$DIST/erect-windows.zip"
 }

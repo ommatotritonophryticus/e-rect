@@ -36,6 +36,13 @@ const TUNED_CAP_RATIO: f32 = 0.8125;
 /// measurement it is taken from.
 const CAP_PROBE_PX: u16 = 100;
 
+/// A standing option before it can be taken. Dimmer than an ordinary hint,
+/// because "not yet" has to read differently from "secondary".
+const OFFER_INERT: Color = Color::new(0.42, 0.42, 0.42, 1.0);
+
+/// The dimmed white every hint and secondary line in the game uses.
+const GREY_TEXT: Color = Color::new(0.78, 0.78, 0.78, 1.0);
+
 pub struct Renderer {
     pub font: Font,
     /// `size_px` -> macroquad font size, for this font's proportions.
@@ -127,6 +134,68 @@ impl Renderer {
         draw_rectangle(body.x, body.y, body.w, body.h, color);
     }
 
+    /// The gate a browser puts in front of every page that wants to make a
+    /// noise.
+    ///
+    /// Not politeness: an AudioContext starts suspended and a suspended one
+    /// does not finish decoding, so the soundtrack cannot even be *loaded*
+    /// before the page has been touched. Asking first is the only honest order
+    /// - the alternative is a progress bar that sits at zero until the player
+    /// happens to press something, which is exactly what this looked like
+    /// before the gate went in.
+    #[cfg(target_arch = "wasm32")]
+    pub fn render_press_to_start(&self, w: f32, h: f32) {
+        let v = Viewport::new(w, h);
+        draw_rectangle(0.0, 0.0, w, h, BLACK);
+        self.draw_centered_shadowed(&v, "E-Rect", 34.0, v.hper(9.0), WHITE);
+        self.draw_centered(&v, "TAP OR PRESS ANY KEY", 50.0, v.hper(5.0), WHITE);
+        self.draw_centered(&v, "TO LOAD THE SOUNDTRACK", 58.0, v.hper(3.5), GREY_TEXT);
+    }
+
+    /// The screen shown while a browser fetches the soundtrack.
+    ///
+    /// Nine files and nine megabytes stand between opening the page and hearing
+    /// anything, and a page that simply sits there for that long reads as
+    /// broken. This says what is happening and how far along it is.
+    ///
+    /// Drawn straight to the window rather than through the game's viewport:
+    /// there is no field yet, and nothing here needs to letterbox.
+    #[cfg(target_arch = "wasm32")]
+    pub fn render_loading(&self, w: f32, h: f32, done: usize, total: usize, what: &str) {
+        let v = Viewport::new(w, h);
+        draw_rectangle(0.0, 0.0, w, h, BLACK);
+        self.draw_centered_shadowed(&v, "E-Rect", 34.0, v.hper(9.0), WHITE);
+        self.draw_centered(&v, "LOADING SOUND", 46.0, v.hper(5.0), WHITE);
+
+        // A bar rather than a percentage: nine steps is few enough that the
+        // number would jump in visible lumps and read as stalling.
+        let (bar_w, bar_h) = (v.wper(50.0), v.hper(2.5));
+        let (bar_x, bar_y) = ((w - bar_w) / 2.0, v.hper(54.0));
+        draw_rectangle(bar_x, bar_y, bar_w, bar_h, Color::new(0.2, 0.2, 0.2, 1.0));
+        let filled = if total == 0 {
+            0.0
+        } else {
+            bar_w * (done as f32 / total as f32)
+        };
+        draw_rectangle(bar_x, bar_y, filled, bar_h, WHITE);
+
+        let caption = format!("{what}  {done}/{total}");
+        self.draw_centered(&v, &caption, 62.0, v.hper(4.0), GREY_TEXT);
+    }
+
+    /// Shown when the soundtrack never arrived. The game is about to start
+    /// anyway - silence is a worse game, not a broken one - so this is a note
+    /// rather than a question.
+    #[cfg(target_arch = "wasm32")]
+    pub fn render_sound_failed(&self, w: f32, h: f32, why: &str) {
+        let v = Viewport::new(w, h);
+        draw_rectangle(0.0, 0.0, w, h, BLACK);
+        self.draw_centered_shadowed(&v, "E-Rect", 34.0, v.hper(9.0), WHITE);
+        self.draw_centered(&v, "NO SOUND THIS TIME", 46.0, v.hper(5.0), WHITE);
+        self.draw_centered(&v, why, 54.0, v.hper(3.2), GREY_TEXT);
+        self.draw_centered(&v, "STARTING ANYWAY", 64.0, v.hper(4.0), GREY_TEXT);
+    }
+
     pub fn render(&self, game: &Game, pads_connected: [bool; MAX_PLAYERS]) {
         let v = &game.viewport;
 
@@ -182,11 +251,7 @@ impl Renderer {
             } else {
                 format!("> {} <", row.label)
             };
-            let color = if selected {
-                WHITE
-            } else {
-                Color::new(0.78, 0.78, 0.78, 1.0)
-            };
+            let color = if selected { WHITE } else { GREY_TEXT };
             let y_pct = menu.row_y_pct(i);
             self.draw_centered_shadowed(v, &label, y_pct, size, color);
 
@@ -229,7 +294,7 @@ impl Renderer {
         self.draw_centered_shadowed(v, "SETTINGS", 16.0, v.hper(8.0), WHITE);
         self.render_menu(game, &game.settings_menu, pads_connected);
 
-        let hint = Color::new(0.78, 0.78, 0.78, 1.0);
+        let hint = GREY_TEXT;
         let size = v.hper(3.5);
         self.draw_centered(v, "LEFT / RIGHT TO CHANGE", 78.0, size, hint);
         self.draw_centered(v, "ESC OR B TO GO BACK", 83.0, size, hint);
@@ -240,7 +305,7 @@ impl Renderer {
         self.draw_centered_shadowed(v, "DEV", 11.0, v.hper(6.0), WHITE);
         self.render_menu(game, &game.dev_menu, pads_connected);
 
-        let hint = Color::new(0.78, 0.78, 0.78, 1.0);
+        let hint = GREY_TEXT;
         let size = v.hper(3.5);
         // Both on the floor band, clear of the last row: the menu now reaches
         // 81% and the old 84% sat in the descenders of BACK.
@@ -338,11 +403,7 @@ impl Renderer {
             // them inert says wait rather than surprising the player with a
             // choice they did not make.
             let armed = offer.armed(game.timer);
-            let face = if armed {
-                WHITE
-            } else {
-                Color::new(0.42, 0.42, 0.42, 1.0)
-            };
+            let face = if armed { WHITE } else { OFFER_INERT };
             for choice in offer.choices.iter() {
                 let body = on_screen(&choice.body, cam);
                 self.draw_actor(v, &body, face);
@@ -517,7 +578,10 @@ impl Renderer {
             self.params(size, WHITE),
         );
         draw_text_ex(
-            format!("wave:{} kill:{}/{}", game.wave, p.kills, game.wave * 10),
+            match game.wave_kill_target() {
+                Some(target) => format!("wave:{} kill:{}/{}", game.wave, p.kills, target),
+                None => format!("wave:{} kill:{}", game.wave, p.kills),
+            },
             v.wper(0.5),
             v.hper(9.5),
             self.params(size, WHITE),
@@ -535,7 +599,10 @@ impl Renderer {
         self.draw_centered(v, &format!("WAVE {}", game.wave), 4.2, size, WHITE);
         self.draw_centered(
             v,
-            &format!("KILL {}/{}", game.total_kills(), game.wave * 10),
+            &match game.wave_kill_target() {
+                Some(target) => format!("KILL {}/{}", game.total_kills(), target),
+                None => format!("KILL {}", game.total_kills()),
+            },
             8.6,
             size,
             WHITE,

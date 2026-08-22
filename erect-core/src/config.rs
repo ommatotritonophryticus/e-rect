@@ -34,6 +34,18 @@ pub const ENERGY_DESPERATION_BONUS: f32 = 2.0;
 /// The wave the flying boss owns. It arrives instead of the ground bosses that
 /// wave would otherwise bring, and only ever one of it turns up.
 pub const FLYING_BOSS_WAVE: i64 = 10;
+
+/// The wave that belongs to the rolled boss, and where it first appears.
+///
+/// Nothing else spawns on it. The boss makes its own crowd out of what it is
+/// hit with, so a wave feeding it one as well would be two sources of enemies
+/// answering to nothing in particular - and the point of this fight is that
+/// every enemy on the field came out of a swing the player chose to take.
+pub const ROLLED_BOSS_WAVE: i64 = 20;
+
+/// Where boss waves start carrying more than one boss, and start choosing which
+/// kinds at random.
+pub const BOSS_RAMP_FIRST_WAVE: i64 = 25;
 /// Twice the *area* of an ordinary flyer, so each side grows by the square root
 /// of two rather than doubling - doubling both sides would be four times the
 /// area, not two.
@@ -338,9 +350,112 @@ pub const MAX_CONCURRENT_ENEMIES: usize = 10;
 pub const ELITE_FIRST_WAVE: i64 = 6;
 
 /// Fraction of a wave's spawn budget that must be spent before its heavy walks
-/// in. The wave opens as an ordinary one and then turns, rather than starting
-/// with the hardest thing in it standing alone on an empty field.
+/// in, while a wave still has only one. The wave opens as an ordinary one and
+/// then turns, rather than starting with the hardest thing in it standing alone
+/// on an empty field.
 pub const ELITE_ENTRY_FRACTION: i64 = 4;
+
+/// Where a wave stops getting bigger and starts getting heavier.
+///
+/// Up to here a wave grows by ten enemies a wave and carries one rolled heavy.
+/// After it the count is frozen and the difficulty is bought a different way:
+/// ordinary enemies are *replaced* by heavies rather than added to.
+pub const ELITE_RAMP_FIRST_WAVE: i64 = 16;
+
+/// Where heavies start arriving two at a time rather than one.
+pub const ELITE_GROUP_WAVE: i64 = 20;
+
+/// Last wave that adds any. After it the number is fixed and only the way they
+/// arrive changes.
+pub const ELITE_RAMP_LAST_WAVE: i64 = 25;
+
+/// How many rolled heavies a wave is made of.
+///
+/// Two more a wave while they still come out one at a time, then one more a
+/// wave once they come out in pairs - the pairing is what stops the number of
+/// separate arrivals growing with the count, so a wave keeps roughly six or
+/// seven of them however heavy it gets.
+pub const fn elites_in_wave(wave: i64) -> usize {
+    if wave < ELITE_RAMP_FIRST_WAVE {
+        return 1;
+    }
+    let capped = if wave > ELITE_RAMP_LAST_WAVE {
+        ELITE_RAMP_LAST_WAVE
+    } else {
+        wave
+    };
+    if capped <= ELITE_GROUP_WAVE {
+        (1 + 2 * (capped - ELITE_RAMP_FIRST_WAVE + 1)) as usize
+    } else {
+        let at_group = 1 + 2 * (ELITE_GROUP_WAVE - ELITE_RAMP_FIRST_WAVE + 1);
+        (at_group + (capped - ELITE_GROUP_WAVE)) as usize
+    }
+}
+
+/// How many come out together.
+///
+/// One, then two, and then one more every wave: past the last ramping wave
+/// there is nothing left to add, so what escalates instead is how much of a
+/// wave's worth arrives at the same moment. It reaches all of them at once
+/// eventually, by walking there rather than in a single step - the difference
+/// between a wave that is harder than the last one and a wall.
+pub const fn elite_group_size(wave: i64) -> usize {
+    if wave < ELITE_GROUP_WAVE {
+        return 1;
+    }
+    if wave <= ELITE_RAMP_LAST_WAVE {
+        return 2;
+    }
+    let grown = (2 + (wave - ELITE_RAMP_LAST_WAVE)) as usize;
+    let all = elites_in_wave(wave);
+    if grown > all {
+        all
+    } else {
+        grown
+    }
+}
+
+/// How many enemies a wave is made of in total, heavies included.
+///
+/// Ten a wave until [`ELITE_RAMP_FIRST_WAVE`], and frozen after: past that
+/// point a wave is not bigger than the one before it, it is made of worse
+/// things. A count that grew *and* turned heavy would be two escalations
+/// stacked, and the field can only hold so many at once anyway.
+/// How many bosses a boss wave carries.
+///
+/// The early boss waves are each a set piece and keep their own answer. From
+/// [`BOSS_RAMP_FIRST_WAVE`] they become a count instead: two, then one more
+/// every boss wave, each of a kind drawn at random.
+pub const fn bosses_in_wave(wave: i64) -> usize {
+    if wave % 5 != 0 {
+        return 0;
+    }
+    if wave < BOSS_RAMP_FIRST_WAVE {
+        // 5 is one, 10 belongs to the flying boss, 15 is a coin flip between
+        // three ground bosses and one shedder, 20 to the rolled boss. Those are
+        // decided where they are spawned; here they are all "one group".
+        return 1;
+    }
+    2 + ((wave - BOSS_RAMP_FIRST_WAVE) / 5) as usize
+}
+
+/// What a boss of this wave is worth in health.
+///
+/// The one number in the late game that still climbs without a ceiling. Shared
+/// so a rolled boss is a boss by the same measure as every other one - that is
+/// the whole of what "a heavy brought up to boss health" means.
+pub fn boss_hp(wave: i64) -> f32 {
+    255.0 * (10.0 * (wave as f32 / 5.0))
+}
+
+pub const fn wave_budget(wave: i64) -> i64 {
+    let counted = if wave > ELITE_RAMP_FIRST_WAVE {
+        ELITE_RAMP_FIRST_WAVE
+    } else {
+        wave
+    };
+    counted * 10
+}
 
 /// The speed a modified wall hands every enemy on the field, as a percentage of
 /// the view per tick.

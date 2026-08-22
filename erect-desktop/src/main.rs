@@ -24,6 +24,8 @@ mod render;
 #[cfg(not(target_arch = "wasm32"))]
 mod sound;
 mod touch;
+#[cfg(target_arch = "wasm32")]
+mod sound_web;
 #[cfg(all(feature = "harness", not(target_arch = "wasm32")))]
 mod harness;
 
@@ -82,6 +84,15 @@ fn edges_only(frame: &InputFrame) -> InputFrame {
     kept
 }
 
+/// Anything at all from the player, for the one moment the game needs to know
+/// only that something happened.
+#[cfg(target_arch = "wasm32")]
+fn touched() -> bool {
+    !touches().is_empty()
+        || is_mouse_button_pressed(MouseButton::Left)
+        || get_last_key_pressed().is_some()
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     // Embedded so the binary is self-contained on every platform - no asset
@@ -125,6 +136,46 @@ async fn main() {
     let mut harness = harness::Harness::from_env(&mut game);
     #[cfg(all(feature = "harness", not(target_arch = "wasm32")))]
     let mut harness_frame = 0u32;
+
+    // Fetch the soundtrack before the first frame of play. Nine files off the
+    // network, a screen between each so the page is never just still.
+    #[cfg(target_arch = "wasm32")]
+    let mut sound = {
+        // Wait to be touched before asking for a note. A browser keeps its
+        // audio suspended until then, and a suspended context never finishes
+        // decoding - so this is not a courtesy, it is the only order in which
+        // the loading below can make progress at all.
+        while !touched() {
+            renderer.render_press_to_start(screen_width(), screen_height());
+            next_frame().await;
+        }
+
+        let mut loader = sound_web::Loader::new(seed);
+        while !loader.settled() {
+            renderer.render_loading(
+                screen_width(),
+                screen_height(),
+                loader.done(),
+                loader.total(),
+                loader.current(),
+            );
+            next_frame().await;
+            loader.pump().await;
+        }
+        let why = loader.problem().map(|w| w.to_string());
+        let count = loader.loaded();
+        let sound = loader.finish();
+        // Say so and carry on. Silence is a worse game, not a broken one - but
+        // it should never be a silence nobody explained.
+        if sound.is_none() {
+            let why = why.unwrap_or_else(|| format!("only {count} files arrived"));
+            for _ in 0..180 {
+                renderer.render_sound_failed(screen_width(), screen_height(), &why);
+                next_frame().await;
+            }
+        }
+        sound
+    };
 
     let mut accumulator = 0.0f64;
     let mut last = get_time();
@@ -204,10 +255,18 @@ async fn main() {
         } else {
             game.audio.clear();
         }
-        // Nothing is listening in a browser yet; the queue still has to be
-        // drained or it grows for the length of the run.
         #[cfg(target_arch = "wasm32")]
-        game.audio.clear();
+        if let Some(s) = sound.as_mut() {
+            s.set_volumes(game.settings.music_volume, game.settings.sfx_volume);
+            s.update(game.music_state(), (dt * 1000.0) as f32);
+            for event in game.audio.drain() {
+                s.fire(event);
+            }
+        } else {
+            // Nothing listening: the queue still has to be drained or it grows
+            // for the length of the run.
+            game.audio.clear();
+        }
 
         // The core flags changed settings; writing them is the platform's job.
         if game.settings.dirty {

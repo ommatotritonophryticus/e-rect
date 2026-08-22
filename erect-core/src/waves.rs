@@ -31,6 +31,33 @@ pub enum GroundKind {
     Shedder,
 }
 
+/// Which boss to put out. From [`BOSS_RAMP_FIRST_WAVE`] each one in a wave is
+/// drawn separately, so a late boss wave is a mixed set rather than a row of
+/// the same thing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BossKind {
+    /// The white slab the game has always had.
+    Ground,
+    Flying,
+    /// Blinks away when hurt and leaves a standing hazard.
+    Shedder,
+    /// A rolled combination at boss health, which makes its own crowd.
+    Rolled,
+}
+
+impl BossKind {
+    pub const ALL: [BossKind; 4] = [
+        BossKind::Ground,
+        BossKind::Flying,
+        BossKind::Shedder,
+        BossKind::Rolled,
+    ];
+
+    fn roll(rng: &mut Rng) -> Self {
+        Self::ALL[rng.range(0, Self::ALL.len() as i32 - 1) as usize]
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FlyerKind {
     Base,
@@ -263,7 +290,8 @@ impl WaveKind {
 }
 
 /// What the wave manager wants the game to do this tick.
-#[derive(Clone, Copy, Debug, PartialEq)]
+// Not `Copy`: a late boss wave carries a list of what it drew.
+#[derive(Clone, Debug, PartialEq)]
 pub enum WaveAction {
     Idle,
     SpawnGround(GroundKind),
@@ -274,9 +302,14 @@ pub enum WaveAction {
     /// Wave 15's alternative: one shedder boss instead of that wave's three
     /// ground bosses. Rolled, so the wave is not the same fight every run.
     SpawnShedderBoss,
-    /// One rolled heavy, from [`ELITE_FIRST_WAVE`] on. What it turns out to be
-    /// is the caller's business - the manager only decides when.
-    SpawnElite,
+    /// A late boss wave's mixed set, each drawn separately.
+    SpawnBossGroup(alloc::vec::Vec<BossKind>),
+    /// Wave 20's whole content: one rolled boss and nothing else at all.
+    SpawnRolledBoss,
+    /// This many rolled heavies at once, from [`ELITE_FIRST_WAVE`] on. What
+    /// they turn out to be is the caller's business - the manager only decides
+    /// how many and when.
+    SpawnElite(usize),
     ClearWave,
 }
 
@@ -289,8 +322,13 @@ pub struct WaveManager {
     pub forced_kind: Option<WaveKind>,
     pub forced_rule: Option<WaveRule>,
     boss_due: bool,
-    /// This wave has not had its rolled heavy yet.
-    elite_due: bool,
+    /// Rolled heavies this wave still owes, and how many come out together.
+    ///
+    /// A count rather than a flag: past [`ELITE_RAMP_FIRST_WAVE`] a wave is
+    /// made of them, and they have to be spread through it rather than all
+    /// turning up at one mark.
+    elites_left: usize,
+    elite_group: usize,
     /// -1 when no countdown is running, otherwise the number still displayed.
     pub countdown: i32,
     countdown_timer: i32,
@@ -305,7 +343,8 @@ impl Default for WaveManager {
             forced_kind: None,
             forced_rule: None,
             boss_due: true,
-            elite_due: true,
+            elites_left: 1,
+            elite_group: 1,
             countdown: -1,
             countdown_timer: 0,
             spawn_timer: 0,
@@ -346,7 +385,30 @@ impl WaveManager {
         let (kind, rule) = (WaveKind::roll(wave, rng), WaveRule::roll(wave, rng));
         self.kind = self.forced_kind.unwrap_or(kind);
         self.rule = self.forced_rule.unwrap_or(rule);
-        self.elite_due = true;
+        self.elites_left = crate::config::elites_in_wave(wave);
+        self.elite_group = crate::config::elite_group_size(wave);
+    }
+
+    /// The spawn count the next heavy is due at.
+    ///
+    /// The arrivals are spread evenly across the wave rather than counted off
+    /// from the start: a wave owing seven of them puts one at every seventh of
+    /// its budget. The first is a whole interval in, so the wave always opens
+    /// as an ordinary one - which is the same reason a single heavy waited for
+    /// a quarter of the budget before this ramp existed.
+    fn next_elite_at(&self, wave: i64) -> i64 {
+        let budget = crate::config::wave_budget(wave);
+        let total = crate::config::elites_in_wave(wave);
+        let group = crate::config::elite_group_size(wave).max(1);
+        // Arrivals, not heavies: a pair is one arrival and takes one slot.
+        let arrivals = total.div_ceil(group).max(1) as i64;
+        if arrivals == 1 {
+            // Nothing to space out. It still waits, for the same reason one
+            // ever did.
+            return budget / crate::config::ELITE_ENTRY_FRACTION;
+        }
+        let done = (total - self.elites_left).div_ceil(group) as i64;
+        (budget * (done + 1)) / (arrivals + 1)
     }
 
     /// Advances pacing by one tick and reports what should happen.
@@ -372,20 +434,34 @@ impl WaveManager {
             return WaveAction::Idle;
         }
 
-        // The wave's own heavy, once, on the way through. Boss waves are
-        // skipped: three bosses and a rolled heavy in one wave is two headlines
-        // reading over each other.
-        if self.elite_due
+        // The wave's heavies, spread through it. Boss waves are skipped: three
+        // bosses and a rolled heavy in one wave is two headlines reading over
+        // each other.
+        if self.elites_left > 0
             && wave >= crate::config::ELITE_FIRST_WAVE
             && wave % 5 != 0
-            && spawn_count >= wave * 10 / crate::config::ELITE_ENTRY_FRACTION
+            && spawn_count >= self.next_elite_at(wave)
         {
-            self.elite_due = false;
+            let group = self.elite_group.min(self.elites_left);
+            self.elites_left -= group;
             self.spawn_timer = rng.range(6, 60);
-            return WaveAction::SpawnElite;
+            return WaveAction::SpawnElite(group);
         }
 
-        if spawn_count < wave * 10 {
+        // A wave that spawns nothing ordinary has spent its budget the moment
+        // its boss is out; there is no count left to work through. Without this
+        // the wave would sit forever a hundred and fifty short of a budget it
+        // was never going to spend.
+        if wave == crate::config::ROLLED_BOSS_WAVE && !self.boss_due {
+            return if live_enemies == 0 {
+                WaveAction::ClearWave
+            } else {
+                self.spawn_timer = 18;
+                WaveAction::Idle
+            };
+        }
+
+        if spawn_count < crate::config::wave_budget(wave) {
             // Boss waves drop their whole group in one go, once per wave.
             if wave % 5 == 0 {
                 if self.boss_due {
@@ -393,7 +469,16 @@ impl WaveManager {
                     self.spawn_timer = rng.range(6, 60); // 100-1000 ms at 60 Hz
                     // One wave belongs to the flying boss, and it comes alone;
                     // every other boss wave keeps its ground bosses.
-                    return if wave == crate::config::FLYING_BOSS_WAVE {
+                    return if wave >= crate::config::BOSS_RAMP_FIRST_WAVE {
+                        // Past the ramp a boss wave is a count and a handful of
+                        // draws rather than a set piece.
+                        let n = crate::config::bosses_in_wave(wave);
+                        WaveAction::SpawnBossGroup(
+                            (0..n).map(|_| BossKind::roll(rng)).collect(),
+                        )
+                    } else if wave == crate::config::ROLLED_BOSS_WAVE {
+                        WaveAction::SpawnRolledBoss
+                    } else if wave == crate::config::FLYING_BOSS_WAVE {
                         WaveAction::SpawnFlyingBoss
                     } else if wave == crate::config::SHEDDER_BOSS_WAVE && rng.flip() {
                         // A coin flip rather than a fixed owner: wave 10 always

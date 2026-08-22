@@ -293,6 +293,40 @@ impl Recipe {
         z
     }
 
+    /// A rolled combination brought up to boss health.
+    ///
+    /// A boss by every measure the game uses - the flag, the payout, the way
+    /// the wall treats it - and a rolled enemy by every other. Two things are
+    /// forced rather than drawn:
+    ///
+    /// - **It broods.** That is what the fight *is*: every enemy on the field
+    ///   came out of a swing the player chose to take, so the crowd is made by
+    ///   the same hand that is trying to clear it. A rolled boss that did not
+    ///   would just be a large sponge.
+    /// - **It does not shed.** A hazard the player cannot remove, left by
+    ///   something that takes hundreds of hits to kill, would fill the ground
+    ///   it is fought on and leave nowhere to stand.
+    pub fn build_boss(&self, v: &Viewport, wave: i64, timer: i64, rng: &mut Rng) -> Zombie {
+        let mut z = self.as_boss().build(v, wave, timer, rng);
+        z.is_boss = true;
+        z.hp = crate::config::boss_hp(wave);
+        z.hpmax = z.hp;
+        // Armour on top of boss health would put it past a thousand connecting
+        // ticks. The health is the whole of the difficulty here.
+        z.armor = 1.0;
+        z
+    }
+
+    /// This combination as a boss would actually be built.
+    ///
+    /// Separate from [`Self::build_boss`] so the name a boss is announced under
+    /// is the name of the thing that arrived. Announcing the roll instead would
+    /// promise a hazard the boss does not leave and hide the brood it always
+    /// has - and the announcement is the only warning the player gets.
+    pub fn as_boss(&self) -> Recipe {
+        Recipe { brood: true, shed: false, ..*self }
+    }
+
     /// The same combination at ordinary strength.
     ///
     /// What a brooding elite throws out. They inherit the *shape* of a rolled

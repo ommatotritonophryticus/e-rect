@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The browser build, wrapped.
+
+  No permissions at all: everything the game needs is inside the package, and
+  the one thing that would normally need a permission - reaching the network -
+  it never does. That is worth keeping true; an offline game asking for INTERNET
+  is a question the player has no way to answer.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.vpngen.erect">
+
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:label="E-Rect"
+        android:icon="@mipmap/icon"
+        android:hardwareAccelerated="true"
+        android:allowBackup="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

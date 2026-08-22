@@ -645,7 +645,7 @@ impl Zombie {
         };
         let mut boss = Self::base(x, v.hper(60.0), v, Rgb::new(255.0, 255.0, 255.0));
         boss.is_boss = true;
-        boss.hp = 255.0 * (10.0 * (wave as f32 / 5.0));
+        boss.hp = crate::config::boss_hp(wave);
         boss.hpmax = boss.hp;
         boss.body.h += v.hper(5.0);
         boss.body.w += v.wper(5.0);
@@ -932,7 +932,24 @@ impl Rng {
         x ^= x >> 7;
         x ^= x << 17;
         self.state = x;
-        x
+        // The state is a xorshift, whose low bits are its weak ones: bit zero
+        // follows a recurrence short enough to see. Everything here that picks
+        // between a handful of things takes a remainder, and a remainder reads
+        // exactly those bits - so `range(0, 3)` was reading the two worst bits
+        // in the word. One wave rule out of five stopped appearing at all when
+        // the pattern of calls around it changed.
+        //
+        // splitmix64's finaliser, the same one the audio pack chooser already
+        // applies for the same reason: every input bit reaches every output
+        // bit, so no position is worse than another and a remainder is safe.
+        Self::mix(x)
+    }
+
+    /// splitmix64's finaliser. Not a generator - a scrambler for one.
+    fn mix(mut x: u64) -> u64 {
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
     }
 
     /// Inclusive on both ends, like the original `rand(min, max)`.

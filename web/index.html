@@ -34,6 +34,8 @@
 <body>
 <canvas id="glcanvas" tabindex="1"></canvas>
 <script src="mq_js_bundle.js"></script>
+    <!-- After the bundle: it defines wasm_memory and miniquad_add_plugin. -->
+    <script src="erect_web.js"></script>
 <script>
   // The canvas is sized in device pixels, not CSS pixels: on a phone those
   // differ by two or three, and the game lays itself out from whatever size it

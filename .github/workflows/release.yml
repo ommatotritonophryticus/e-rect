@@ -1,0 +1,171 @@
+# Builds every shippable artefact and attaches them to a GitHub Release.
+#
+# Runs on a version tag, and on a button in the Actions tab for a dry run that
+# builds everything and publishes nothing.
+#
+# Each target is built on a runner that *is* that platform, rather than in the
+# container tools/release.sh uses on a workstation. A runner is already a pinned
+# image, so the reproducibility the container buys is already paid for - and a
+# container inside it would only add a download.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# The default token is read-only. Creating a release needs this, and nothing
+# else here does, so it is the only permission granted.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action: rust-toolchain.toml pins the compiler and the wasm
+      # target, and the runner's rustup honours it. Naming a version here would
+      # be a second place to forget.
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      - run: cargo test --release
+
+  desktop:
+    name: ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: linux-x86_64
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: linux-aarch64
+          - name: windows
+            runner: windows-latest
+            target: windows
+          - name: macos
+            runner: macos-latest
+            target: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.runner, 'ubuntu')
+        # cpal wants the ALSA headers and gilrs wants libudev. X11 and OpenGL
+        # are dlopened at runtime, so they are not needed to compile.
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+
+      - name: Build and package
+        shell: bash
+        # ERECT_NATIVE tells the script the runner is the target machine and
+        # there is no container to reach for.
+        run: ERECT_NATIVE=1 tools/release.sh ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erect-${{ matrix.name }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  psp:
+    name: psp
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The nightly and rust-src come from erect-psp/rust-toolchain.toml, so
+      # this only has to install the tool that reads them.
+      - name: Cache cargo-psp
+        id: cargo-psp
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-psp
+          key: cargo-psp-0.2.9-${{ runner.os }}
+      - name: Install cargo-psp
+        if: steps.cargo-psp.outputs.cache-hit != 'true'
+        run: cargo install cargo-psp --version 0.2.9 --locked
+      - name: Build and package
+        run: tools/release.sh psp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erect-psp
+          path: dist/*.zip
+          if-no-files-found: error
+
+  android:
+    name: android
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A GitHub runner ships a JDK and an Android SDK already, and sets
+      # ANDROID_HOME - which tools/android.sh honours.
+      - name: Build APK
+        env:
+          # Absent on a fork or a dry run, and then the script falls back to its
+          # own debug key. An APK signed with that installs and plays; it simply
+          # cannot update one signed with the release key.
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: tools/android.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erect-android
+          path: dist/erect.apk
+          if-no-files-found: error
+
+  web:
+    name: web
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: tools/web.sh
+      - name: Archive
+        run: cd dist/web && zip -q -r -X ../erect-web.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: erect-web
+          path: dist/erect-web.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    # Only a tag publishes. A dry run from the Actions tab builds everything and
+    # stops, which is the point of being able to press it.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, psp, android, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        # The `gh` CLI rather than a third-party action: it is already on the
+        # runner, it is maintained by the same people as the API it calls, and
+        # a release workflow holding a write token is the last place to add a
+        # dependency nobody in this repository reviews.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          files=$(find artifacts -type f | sort)
+          test -n "$files" || { echo "nothing was built"; exit 1; }
+          echo "$files"
+          gh release create "${GITHUB_REF_NAME}" $files \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

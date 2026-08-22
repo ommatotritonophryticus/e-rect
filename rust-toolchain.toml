@@ -9,3 +9,9 @@
 # the working directory, so building inside erect-psp gets that one instead.
 [toolchain]
 channel = "1.97.1"
+# The browser build needs this, and naming it here is what makes the whole
+# repository build with nothing installed by hand. `rustup target add` would
+# also do it, but only if run from inside the repository - run anywhere else it
+# adds the target to whatever toolchain is default there, which is not this one,
+# and the wasm build then fails with "can't find crate for `core`".
+targets = ["wasm32-unknown-unknown"]

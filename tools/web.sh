@@ -20,9 +20,19 @@ echo "== building for the browser"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 cp "$ROOT/target/wasm32-unknown-unknown/release/erect.wasm" "$OUT/"
-cp "$ROOT/web/index.html" "$ROOT/web/mq_js_bundle.js" "$OUT/"
+cp "$ROOT/web/index.html" "$ROOT/web/mq_js_bundle.js" "$ROOT/web/erect_web.js" "$OUT/"
+
+# The soundtrack is fetched at runtime rather than baked into the wasm, so the
+# packs have to sit beside the page. Only the desktop encoding: the PSP's 8-bit
+# wavs are half the size and sound it, and a browser decodes FLAC natively.
+for pack in "$ROOT"/packs/*/; do
+    name=$(basename "$pack")
+    mkdir -p "$OUT/packs/$name"
+    cp -R "$pack/desktop" "$OUT/packs/$name/"
+done
 
 printf '  %s (%s)\n' erect.wasm "$(du -h "$OUT/erect.wasm" | cut -f1)"
+printf '  %s (%s)\n' packs "$(du -sh "$OUT/packs" | cut -f1)"
 
 if [ "${1:-}" != "serve" ]; then
     echo "== done: $OUT"

@@ -24,7 +24,7 @@ use crate::menu::{Menu, MenuAction, MenuRow};
 use crate::recipe::{Recipe, BROOD_MAX};
 use crate::offer::{Offer, OfferItem, OFFER_SCORE_STEP};
 use crate::settings::{SchemeInfo, Settings, VolumeChannel};
-use crate::waves::{FlyerKind, GroundKind, WaveAction, WaveManager, WaveRule};
+use crate::waves::{BossKind, FlyerKind, GroundKind, WaveAction, WaveManager, WaveRule};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum State {
@@ -317,9 +317,27 @@ impl Game {
             // Frozen enemies on the result screen are scenery, not a threat.
             zombies: if over { 0 } else { self.zombies.len() },
             flyers: if over { 0 } else { self.flyers.len() },
+            // A rolled heavy counts too. It is not a boss by the flag - that
+            // one also decides how the wall treats it and what it pays - but it
+            // is the same thing to listen to: one enemy the wave is about,
+            // standing there taking eleven swings.
             boss: !over
-                && (self.zombies.iter().any(|z| z.is_boss)
+                && (self.zombies.iter().any(|z| z.is_boss || z.elite)
                     || self.flyers.iter().any(|f| f.is_boss)),
+        }
+    }
+
+    /// How many enemies this wave will put out, for the HUD to count against.
+    ///
+    /// `None` on a wave that spawns nothing but its boss. There the number to
+    /// reach would be one, and the boss makes more enemies than that out of
+    /// being hit - so a count against a target would run past it and read as
+    /// broken. What ends that wave is killing the thing, not reaching a number.
+    pub fn wave_kill_target(&self) -> Option<i64> {
+        if self.wave == ROLLED_BOSS_WAVE {
+            None
+        } else {
+            Some(wave_budget(self.wave))
         }
     }
 
@@ -1515,6 +1533,33 @@ impl Game {
         }
     }
 
+    /// A rolled combination at boss health, named on arrival like any other.
+    fn spawn_rolled_boss(&mut self) {
+        let v = self.viewport;
+        // Forced first, so the name below is the name of what arrives.
+        let recipe = Recipe::roll(self.wave, &mut self.elite_rng).as_boss();
+        let mut z = recipe.build_boss(&v, self.wave, self.timer, &mut self.elite_rng);
+        z.body.x += self.camera_x;
+        self.elite_notice = Some((recipe.label(), self.timer));
+        self.zombies.push(z);
+    }
+
+    fn spawn_flying_boss(&mut self) {
+        let v = self.viewport;
+        let size_ref = self.players[0].body;
+        let timer = self.timer;
+        let mut f = Flyer::flying_boss(&v, &size_ref, timer, &mut self.rng);
+        f.body.x += self.camera_x;
+        self.flyers.push(f);
+    }
+
+    fn spawn_shedder_boss(&mut self) {
+        let v = self.viewport;
+        let mut boss = Zombie::shedder_boss(&v, &mut self.rng);
+        boss.body.x += self.camera_x;
+        self.zombies.push(boss);
+    }
+
     fn advance_waves(&mut self) {
         let live = self.zombies.len() + self.flyers.len();
         let action = self
@@ -1571,30 +1616,52 @@ impl Game {
             WaveAction::SpawnShedderBoss => {
                 self.background.set_target(BG_FIGHT);
                 self.spawn_count += 1;
-                let mut boss = Zombie::shedder_boss(&v, &mut self.rng);
-                boss.body.x += self.camera_x;
-                self.zombies.push(boss);
+                self.spawn_shedder_boss();
             }
             WaveAction::SpawnFlyingBoss => {
                 self.background.set_target(BG_FIGHT);
                 self.spawn_count += 1;
-                let size_ref = self.players[0].body;
-                let timer = self.timer;
-                let mut f = Flyer::flying_boss(&v, &size_ref, timer, &mut self.rng);
-                f.body.x += self.camera_x;
-                self.flyers.push(f);
+                self.spawn_flying_boss();
             }
-            WaveAction::SpawnElite => {
+            WaveAction::SpawnElite(count) => {
+                self.background.set_target(BG_FIGHT);
+                // Each one replaces an ordinary enemy rather than adding to the
+                // wave: past the ramp the wave is the same size and made of
+                // worse things, which is the whole shape of the late game.
+                for _ in 0..count {
+                    self.spawn_count += 1;
+                    let recipe = Recipe::roll(self.wave, &mut self.elite_rng);
+                    let mut z = recipe.build(&v, self.wave, self.timer, &mut self.elite_rng);
+                    z.body.x += self.camera_x;
+                    // Named on arrival and only then. The halo says "not off
+                    // the list"; this says which one of the sixty-four it is,
+                    // once, while there is still time to act on knowing. With
+                    // several at once the last one named is the one that shows,
+                    // which is the honest summary of a pair.
+                    self.elite_notice = Some((recipe.label(), self.timer));
+                    self.zombies.push(z);
+                }
+            }
+            WaveAction::SpawnRolledBoss => {
                 self.background.set_target(BG_FIGHT);
                 self.spawn_count += 1;
-                let recipe = Recipe::roll(self.wave, &mut self.elite_rng);
-                let mut z = recipe.build(&v, self.wave, self.timer, &mut self.elite_rng);
-                z.body.x += self.camera_x;
-                // Named on arrival and only then. The halo says "not off the
-                // list"; this says which one of the sixty-four it is, once,
-                // while there is still time to act on knowing.
-                self.elite_notice = Some((recipe.label(), self.timer));
-                self.zombies.push(z);
+                self.spawn_rolled_boss();
+            }
+            WaveAction::SpawnBossGroup(kinds) => {
+                self.background.set_target(BG_FIGHT);
+                for kind in kinds {
+                    self.spawn_count += 1;
+                    match kind {
+                        BossKind::Ground => {
+                            let mut boss = Zombie::boss(&v, self.wave, &mut self.rng);
+                            boss.body.x += self.camera_x;
+                            self.zombies.push(boss);
+                        }
+                        BossKind::Flying => self.spawn_flying_boss(),
+                        BossKind::Shedder => self.spawn_shedder_boss(),
+                        BossKind::Rolled => self.spawn_rolled_boss(),
+                    }
+                }
             }
             WaveAction::ClearWave => self.on_wave_cleared(),
         }

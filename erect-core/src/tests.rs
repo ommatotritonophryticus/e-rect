@@ -8,6 +8,10 @@ use alloc::string::{String, ToString};
 use crate::attack::{AttackKind, MAX_LEVEL};
 use crate::recipe::{unlock, MoveKind, Recipe, Size, BROOD_MAX, ELITE_COLOR, ELITE_HP};
 use crate::boon::{Boon, Boons, WallMod, SHIELD_COOLDOWN_TICKS};
+use crate::config::{
+    boss_hp, elite_group_size, elites_in_wave as elite_count, wave_budget, ROLLED_BOSS_WAVE,
+};
+use crate::waves::BossKind;
 use crate::entities::Reach;
 use crate::offer::{Offer, OfferItem, OFFER_ARM_TICKS, OFFER_SCORE_STEP};
 use crate::config::*;
@@ -1625,17 +1629,22 @@ fn boss_action_seeded(wave: i64, seed: u64) -> Option<WaveAction> {
     let mut rng = Rng::new(seed);
     for _ in 0..5000 {
         match waves.update(wave, 0, 0, &mut rng) {
-            WaveAction::SpawnBosses(n) => return Some(WaveAction::SpawnBosses(n)),
-            WaveAction::SpawnFlyingBoss => return Some(WaveAction::SpawnFlyingBoss),
-            WaveAction::SpawnShedderBoss => return Some(WaveAction::SpawnShedderBoss),
-            _ => {}
+            WaveAction::Idle
+            | WaveAction::SpawnGround(_)
+            | WaveAction::SpawnFlyer(_)
+            | WaveAction::SpawnElite(_)
+            | WaveAction::ClearWave => {}
+            // Everything else *is* a boss arriving, and listing them here
+            // rather than matching a few by name is what makes a new kind of
+            // boss show up in this test instead of being quietly ignored.
+            boss => return Some(boss),
         }
     }
     None
 }
 
 #[test]
-fn wave_ten_belongs_to_the_flying_boss_and_the_others_keep_ground_bosses() {
+fn each_early_boss_wave_keeps_its_own_set_piece() {
     assert_eq!(boss_action_for(5), Some(WaveAction::SpawnBosses(1)));
     assert_eq!(
         boss_action_for(FLYING_BOSS_WAVE),
@@ -1647,8 +1656,9 @@ fn wave_ten_belongs_to_the_flying_boss_and_the_others_keep_ground_bosses() {
         boss_action_for(SHEDDER_BOSS_WAVE),
         Some(WaveAction::SpawnBosses(3)) | Some(WaveAction::SpawnShedderBoss)
     ));
-    // Past it, the ordinary boss waves carry on unchanged.
-    assert_eq!(boss_action_for(20), Some(WaveAction::SpawnBosses(4)));
+    // Twenty used to be four ground bosses and is now the rolled boss's own
+    // wave - the only one that spawns nothing else at all.
+    assert_eq!(boss_action_for(ROLLED_BOSS_WAVE), Some(WaveAction::SpawnRolledBoss));
     // And a non-boss wave still brings none.
     assert_eq!(boss_action_for(7), None);
 }
@@ -2035,12 +2045,17 @@ fn a_held_wave_opens_on_full_health() {
     game.players[0].hp = 20.0;
 
     // Clear waves until a held one comes round, then check the handover.
+    //
+    // The field is emptied every tick rather than once a wave: a wave ends when
+    // its budget is spent *and* nothing is left standing, and a late wave keeps
+    // putting rolled heavies out for as long as it owes any. Emptying it once
+    // and waiting would wait forever.
     for _ in 0..400 {
-        game.spawn_count = game.wave * 10;
-        game.zombies.clear();
-        game.flyers.clear();
         let was = game.wave;
-        for _ in 0..80 {
+        for _ in 0..200 {
+            game.spawn_count = wave_budget(game.wave);
+            game.zombies.clear();
+            game.flyers.clear();
             game.tick(&idle());
             if game.wave > was {
                 break;
@@ -2055,7 +2070,10 @@ fn a_held_wave_opens_on_full_health() {
         }
         game.players[0].hp = 20.0;
     }
-    panic!("never rolled a held wave");
+    panic!(
+        "never rolled a held wave; reached wave {} after 400 tries",
+        game.wave
+    );
 }
 
 #[test]
@@ -2893,9 +2911,9 @@ fn elites_in_wave(wave: i64) -> usize {
         match manager.update(wave, spawned, 0, &mut rng) {
             WaveAction::Idle => {}
             WaveAction::ClearWave => break,
-            WaveAction::SpawnElite => {
-                count += 1;
-                spawned += 1;
+            WaveAction::SpawnElite(n) => {
+                count += n;
+                spawned += n as i64;
             }
             _ => spawned += 1,
         }
@@ -2914,8 +2932,8 @@ fn rolled_heavies_start_at_the_sixth_wave() {
 }
 
 #[test]
-fn one_rolled_heavy_a_wave_and_never_on_a_boss_wave() {
-    for wave in ELITE_FIRST_WAVE..24 {
+fn one_rolled_heavy_a_wave_until_the_ramp_and_never_on_a_boss_wave() {
+    for wave in ELITE_FIRST_WAVE..ELITE_RAMP_FIRST_WAVE {
         let want = if wave % 5 == 0 { 0 } else { 1 };
         assert_eq!(
             elites_in_wave(wave),
@@ -2923,6 +2941,154 @@ fn one_rolled_heavy_a_wave_and_never_on_a_boss_wave() {
             "wave {wave} produced the wrong number of heavies"
         );
     }
+}
+
+/// Runs a wave and reports every arrival of heavies: how many came at once,
+/// and at what fraction of the wave's budget.
+fn elite_arrivals(wave: i64) -> alloc::vec::Vec<(usize, i64)> {
+    let mut manager = WaveManager::default();
+    let mut rng = Rng::new(wave as u64 * 31 + 7);
+    manager.begin_wave(wave, &mut rng);
+    manager.skip_countdown();
+    let budget = crate::config::wave_budget(wave).max(1);
+    let mut out = alloc::vec::Vec::new();
+    let mut spawned = 0i64;
+    for _ in 0..200_000 {
+        match manager.update(wave, spawned, 0, &mut rng) {
+            WaveAction::Idle => {}
+            WaveAction::ClearWave => break,
+            WaveAction::SpawnElite(n) => {
+                out.push((n, spawned * 100 / budget));
+                spawned += n as i64;
+            }
+            _ => spawned += 1,
+        }
+    }
+    out
+}
+
+#[test]
+fn the_eighteenth_wave_is_seven_heavies_evenly_spread() {
+    // Straight from the specification, and the reason the spacing divides by
+    // one more than the count: seven arrivals want seven gaps between them and
+    // a gap at each end, or the last one lands exactly as the wave runs out.
+    let arrivals = elite_arrivals(18);
+    assert_eq!(arrivals.len(), 7, "seven separate arrivals");
+    assert_eq!(arrivals.iter().map(|(n, _)| n).sum::<usize>(), 7);
+    assert!(arrivals.iter().all(|(n, _)| *n == 1), "one at a time this early");
+
+    let at: alloc::vec::Vec<i64> = arrivals.iter().map(|(_, p)| *p).collect();
+    assert!(at[0] > 5, "the wave should open as an ordinary one, not at {}%", at[0]);
+    assert!(*at.last().unwrap() < 95, "and not finish on one either");
+    // Evenly: every gap the same, to within the rounding of whole spawns.
+    let gaps: alloc::vec::Vec<i64> = at.windows(2).map(|w| w[1] - w[0]).collect();
+    let (lo, hi) = (
+        *gaps.iter().min().unwrap(),
+        *gaps.iter().max().unwrap(),
+    );
+    assert!(hi - lo <= 2, "the gaps are uneven: {gaps:?}");
+}
+
+#[test]
+fn the_twenty_second_wave_is_thirteen_in_pairs_and_one_alone() {
+    // The other worked example: thirteen does not halve, so six pairs and a
+    // single - seven arrivals, the same number of arrivals as the eighteenth
+    // wave had. That is what pairing them up buys.
+    let arrivals = elite_arrivals(22);
+    assert_eq!(arrivals.iter().map(|(n, _)| n).sum::<usize>(), 13);
+    assert_eq!(arrivals.len(), 7, "seven arrivals");
+    assert_eq!(arrivals.iter().filter(|(n, _)| *n == 2).count(), 6, "six pairs");
+    assert_eq!(arrivals.iter().filter(|(n, _)| *n == 1).count(), 1, "and one alone");
+}
+
+#[test]
+fn the_ramp_climbs_by_two_then_by_one_and_then_stops() {
+    let counts: alloc::vec::Vec<usize> = (15..=27).map(elite_count).collect();
+    assert_eq!(
+        counts,
+        alloc::vec![1, 3, 5, 7, 9, 11, 12, 13, 14, 15, 16, 16, 16],
+        "the ramp does not match the one that was asked for"
+    );
+}
+
+#[test]
+fn a_wave_stops_getting_bigger_where_it_starts_getting_heavier() {
+    // The two halves of the same decision: past the ramp a wave is not larger
+    // than the one before it, it is made of worse things. Growing *and* turning
+    // heavy would be two escalations stacked on each other.
+    for wave in 1..ELITE_RAMP_FIRST_WAVE {
+        assert_eq!(wave_budget(wave), wave * 10);
+    }
+    let frozen = wave_budget(ELITE_RAMP_FIRST_WAVE);
+    for wave in ELITE_RAMP_FIRST_WAVE..40 {
+        assert_eq!(wave_budget(wave), frozen, "wave {wave} grew");
+    }
+}
+
+#[test]
+fn heavies_replace_ordinary_enemies_rather_than_joining_them() {
+    // Each one spends a slot out of the wave's budget, so a wave of a hundred
+    // and sixty with sixteen heavies is a hundred and forty-four ordinary ones
+    // and not a hundred and sixty.
+    let wave = 22;
+    let mut manager = WaveManager::default();
+    let mut rng = Rng::new(4242);
+    manager.begin_wave(wave, &mut rng);
+    manager.skip_countdown();
+    let (mut spawned, mut heavies, mut plain) = (0i64, 0usize, 0usize);
+    for _ in 0..200_000 {
+        match manager.update(wave, spawned, 0, &mut rng) {
+            WaveAction::Idle => {}
+            WaveAction::ClearWave => break,
+            WaveAction::SpawnElite(n) => {
+                heavies += n;
+                spawned += n as i64;
+            }
+            _ => {
+                plain += 1;
+                spawned += 1;
+            }
+        }
+    }
+    assert_eq!(heavies, elite_count(wave));
+    assert_eq!(
+        (heavies + plain) as i64,
+        wave_budget(wave),
+        "the wave should still be exactly its budget"
+    );
+}
+
+#[test]
+fn past_the_last_ramping_wave_the_groups_grow_instead() {
+    // Nothing left to add, so what escalates is how much lands at once - and it
+    // walks there rather than jumping. A wave that went straight from eight
+    // arrivals to one would not be harder than the wave before it, it would be
+    // a wall.
+    let sizes: alloc::vec::Vec<usize> = (25..=32).map(elite_group_size).collect();
+    assert_eq!(sizes, alloc::vec![2, 3, 4, 5, 6, 7, 8, 9]);
+
+    // Every wave past the ramp is still the same number of heavies, arriving
+    // in fewer and fewer pieces.
+    let mut previous = usize::MAX;
+    for wave in 26..40i64 {
+        if wave % 5 == 0 {
+            continue;
+        }
+        let arrivals = elite_arrivals(wave);
+        assert_eq!(
+            arrivals.iter().map(|(n, _)| n).sum::<usize>(),
+            elite_count(wave),
+            "wave {wave} owes the wrong number"
+        );
+        assert!(
+            arrivals.len() <= previous,
+            "wave {wave} came in more pieces than the wave before it"
+        );
+        previous = arrivals.len();
+    }
+
+    // And it does arrive all at once in the end, without a step to get there.
+    assert_eq!(elite_group_size(60), elite_count(60));
 }
 
 #[test]
@@ -2939,7 +3105,7 @@ fn a_heavy_waits_until_the_wave_is_under_way() {
         match manager.update(wave, spawned, 0, &mut rng) {
             WaveAction::Idle => {}
             WaveAction::ClearWave => break,
-            WaveAction::SpawnElite => {
+            WaveAction::SpawnElite(_) => {
                 assert!(spawned > 0, "it walked in before anything else did");
                 assert!(
                     spawned >= wave * 10 / ELITE_ENTRY_FRACTION,
@@ -3038,6 +3204,62 @@ fn what_a_heavy_turns_out_to_be_is_not_shifted_by_the_fight() {
     let quiet = names(0);
     assert!(!quiet.is_empty(), "nothing arrived, so nothing is proven");
     assert_eq!(quiet, names(120), "the fight changed which enemy showed up");
+}
+
+#[test]
+fn a_rolled_heavy_brings_the_boss_track_with_it() {
+    let mut game = new_game();
+    game.start_run(1);
+    game.state = State::Playing;
+    game.waves.skip_countdown();
+    game.zombies.clear();
+    game.flyers.clear();
+    assert!(!game.music_state().boss, "nothing on the field yet");
+
+    let v = game.viewport;
+    let plain = Zombie::from_edge(&v, &mut game.rng, TEST_ENEMY_COLOR);
+    game.zombies.push(plain);
+    assert!(!game.music_state().boss, "an ordinary enemy is not an occasion");
+
+    let heavy = Recipe {
+        movement: MoveKind::Run,
+        size: Size::Normal,
+        shoot: false,
+        blink: false,
+        shed: false,
+        brood: false,
+    }
+    .build(&v, ELITE_FIRST_WAVE, 0, &mut game.rng);
+    game.zombies.push(heavy);
+    assert!(game.music_state().boss, "a rolled heavy should bring the track");
+
+    game.zombies.retain(|z| !z.elite);
+    assert!(!game.music_state().boss, "and take it away again when it dies");
+}
+
+#[test]
+fn young_do_not_keep_the_boss_track_playing() {
+    // They wear the parent's colour but they are ordinary enemies, and a field
+    // of them after the parent is dead is not still a boss fight.
+    let mut game = new_game();
+    game.start_run(1);
+    game.state = State::Playing;
+    game.waves.skip_countdown();
+    game.zombies.clear();
+    game.flyers.clear();
+
+    let v = game.viewport;
+    let minion = Recipe {
+        movement: MoveKind::Run,
+        size: Size::Normal,
+        shoot: false,
+        blink: false,
+        shed: false,
+        brood: false,
+    }
+    .build_minion(&v, 0, &mut game.rng);
+    game.zombies.push(minion);
+    assert!(!game.music_state().boss);
 }
 
 /* ---------------- the brood ---------------- */
@@ -6090,4 +6312,211 @@ fn a_live_blast_bites_once_however_long_it_covers_you() {
         .expect("the target wandered off")
         .hp;
     assert_eq!(MARK - left, COMBO_BLAST_DAMAGE, "exactly one bite");
+}
+
+#[test]
+fn the_generator_is_usable_in_its_low_bits() {
+    // Everything that picks between a handful of things takes a remainder, and
+    // a remainder reads the lowest bits. A raw xorshift's lowest bits follow a
+    // recurrence short enough to see: `range(0, 3)` once went four hundred
+    // draws in a live run without ever returning 0, which took one wave rule
+    // out of five out of the game.
+    let mut rng = Rng::new(1);
+    let mut counts = [0usize; 4];
+    const DRAWS: usize = 40_000;
+    for _ in 0..DRAWS {
+        counts[rng.range(0, 3) as usize] += 1;
+    }
+    let want = DRAWS / 4;
+    for (value, seen) in counts.iter().enumerate() {
+        let off = (*seen as i64 - want as i64).abs();
+        assert!(
+            off < want as i64 / 10,
+            "range(0, 3) returned {value} {seen} times in {DRAWS}, wanted about {want}"
+        );
+    }
+
+    // The single lowest bit, which is what `flip` reads.
+    let mut rng = Rng::new(1);
+    let heads = (0..DRAWS).filter(|_| rng.flip()).count();
+    let off = (heads as i64 - want as i64 * 2).abs();
+    assert!(off < DRAWS as i64 / 20, "flip came up heads {heads} times in {DRAWS}");
+}
+
+#[test]
+fn every_wave_rule_still_reaches_a_real_run() {
+    // The distribution above is the mechanism; this is the thing that broke.
+    let mut game = new_game();
+    game.start_run(1);
+    let mut seen = alloc::vec![false; 5];
+    for _ in 0..400 {
+        let was = game.wave;
+        for _ in 0..200 {
+            game.spawn_count = wave_budget(game.wave);
+            game.zombies.clear();
+            game.flyers.clear();
+            game.tick(&idle());
+            if game.wave > was {
+                break;
+            }
+        }
+        let i = match game.waves.rule {
+            WaveRule::Normal => 0,
+            WaveRule::StaticCamera => 1,
+            WaveRule::NoJumps => 2,
+            WaveRule::NoWall => 3,
+            WaveRule::Hidden => 4,
+        };
+        seen[i] = true;
+    }
+    assert!(seen.iter().all(|s| *s), "some rule never came up: {seen:?}");
+}
+
+/* ---------------- the rolled boss ---------------- */
+
+/// Runs a boss wave and reports what it put out.
+fn boss_wave(wave: i64, seed: u64) -> (alloc::vec::Vec<BossKind>, usize, bool) {
+    let mut manager = WaveManager::default();
+    let mut rng = Rng::new(seed);
+    manager.begin_wave(wave, &mut rng);
+    manager.skip_countdown();
+    let (mut spawned, mut plain, mut cleared) = (0i64, 0usize, false);
+    let mut kinds = alloc::vec::Vec::new();
+    for _ in 0..500_000 {
+        match manager.update(wave, spawned, 0, &mut rng) {
+            WaveAction::Idle => {}
+            WaveAction::ClearWave => {
+                cleared = true;
+                break;
+            }
+            WaveAction::SpawnBosses(n) => {
+                for _ in 0..n {
+                    kinds.push(BossKind::Ground);
+                }
+                spawned += n;
+            }
+            WaveAction::SpawnFlyingBoss => {
+                kinds.push(BossKind::Flying);
+                spawned += 1;
+            }
+            WaveAction::SpawnShedderBoss => {
+                kinds.push(BossKind::Shedder);
+                spawned += 1;
+            }
+            WaveAction::SpawnRolledBoss => {
+                kinds.push(BossKind::Rolled);
+                spawned += 1;
+            }
+            WaveAction::SpawnBossGroup(k) => {
+                spawned += k.len() as i64;
+                kinds.extend(k);
+            }
+            WaveAction::SpawnElite(n) => spawned += n as i64,
+            _ => {
+                plain += 1;
+                spawned += 1;
+            }
+        }
+    }
+    (kinds, plain, cleared)
+}
+
+#[test]
+fn the_twentieth_wave_is_one_boss_and_nothing_else() {
+    let (kinds, plain, cleared) = boss_wave(ROLLED_BOSS_WAVE, 4242);
+    assert_eq!(kinds, alloc::vec![BossKind::Rolled]);
+    assert_eq!(plain, 0, "the wave should spawn nothing but the boss");
+    assert!(cleared, "and it still has to be able to end");
+}
+
+#[test]
+fn a_wave_that_spawns_nothing_can_still_finish() {
+    // The trap in switching ordinary spawning off: a wave ends when its budget
+    // is spent, and a wave that never spawns never spends one. It would sit a
+    // hundred and fifty short of a number it was never going to reach.
+    let (_, _, cleared) = boss_wave(ROLLED_BOSS_WAVE, 7);
+    assert!(cleared);
+    // And the HUD must not count against that number either.
+    let mut game = new_game();
+    game.start_run(1);
+    game.wave = ROLLED_BOSS_WAVE;
+    assert_eq!(game.wave_kill_target(), None);
+    game.wave = ROLLED_BOSS_WAVE + 1;
+    assert_eq!(game.wave_kill_target(), Some(wave_budget(ROLLED_BOSS_WAVE + 1)));
+}
+
+#[test]
+fn the_rolled_boss_is_a_boss_by_every_measure_the_game_uses() {
+    let mut game = new_game();
+    let v = game.viewport;
+    let recipe = Recipe {
+        movement: MoveKind::Run,
+        size: Size::Normal,
+        shoot: false,
+        blink: false,
+        shed: true,
+        brood: false,
+    };
+    let boss = recipe.build_boss(&v, ROLLED_BOSS_WAVE, 0, &mut game.rng);
+    assert!(boss.is_boss, "the wall and the payout both read this flag");
+    assert_eq!(boss.hpmax, boss_hp(ROLLED_BOSS_WAVE));
+    assert_eq!(boss.hpmax, Zombie::boss(&v, ROLLED_BOSS_WAVE, &mut game.rng).hpmax);
+    assert_eq!(boss.armor, 1.0, "boss health is the difficulty; armour on top is not");
+
+    // Two traits are forced whatever the roll said.
+    assert!(boss.broods, "making its own crowd is the whole fight");
+    assert!(
+        !boss.behaviors.shed,
+        "a hazard left by something that takes hundreds of hits would fill the floor"
+    );
+}
+
+#[test]
+fn late_boss_waves_grow_and_mix() {
+    for (wave, want) in [(25i64, 2usize), (30, 3), (35, 4), (40, 5)] {
+        let (kinds, _, _) = boss_wave(wave, wave as u64 * 13 + 1);
+        assert_eq!(kinds.len(), want, "wave {wave} carried the wrong number");
+    }
+    // Drawn separately, so a late wave is a mixed set rather than a row of the
+    // same thing. Over enough runs every kind has to turn up.
+    let mut seen = alloc::vec![false; BossKind::ALL.len()];
+    for seed in 0..200u64 {
+        for kind in boss_wave(40, seed).0 {
+            seen[BossKind::ALL.iter().position(|k| *k == kind).unwrap()] = true;
+        }
+    }
+    assert!(seen.iter().all(|s| *s), "some boss kind is never drawn: {seen:?}");
+}
+
+#[test]
+fn the_early_boss_waves_are_left_as_they_were() {
+    assert_eq!(boss_wave(5, 1).0, alloc::vec![BossKind::Ground]);
+    assert_eq!(boss_wave(FLYING_BOSS_WAVE, 1).0, alloc::vec![BossKind::Flying]);
+    // Fifteen is a coin flip between three ground bosses and one shedder.
+    let mut saw_both = (false, false);
+    for seed in 0..40u64 {
+        match boss_wave(SHEDDER_BOSS_WAVE, seed).0.len() {
+            1 => saw_both.0 = true,
+            3 => saw_both.1 = true,
+            n => panic!("wave 15 produced {n} bosses"),
+        }
+    }
+    assert!(saw_both.0 && saw_both.1, "the coin flip stopped being a coin flip");
+}
+
+#[test]
+fn a_rolled_boss_is_announced_as_what_it_actually_is() {
+    // The announcement is the only warning the player gets, and two of the
+    // traits are decided rather than drawn. Naming the roll would promise a
+    // hazard the boss does not leave and hide the brood it always has.
+    let mut rng = Rng::new(99);
+    for _ in 0..200 {
+        let rolled = Recipe::roll(ROLLED_BOSS_WAVE, &mut rng);
+        let named = rolled.as_boss();
+        assert!(named.brood, "every one of them broods");
+        assert!(!named.shed, "and none of them sheds");
+        let label = named.label();
+        assert!(label.contains("BROOD"), "the name hides the brood: {label}");
+        assert!(!label.contains("TRAP"), "the name promises a hazard: {label}");
+    }
 }
